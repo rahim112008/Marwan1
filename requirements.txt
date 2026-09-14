@@ -1,0 +1,50 @@
+# ============================================================
+# 🐄 Bovine SNP Platform v3.0 — requirements.txt
+# ============================================================
+# Python recommandé : 3.11 ou 3.12
+# Installation : pip install -r requirements.txt
+# ============================================================
+
+# --- Build tools (à installer en premier, évite les erreurs de compilation) ---
+setuptools>=68.0.0
+wheel>=0.41.0
+pip>=23.3.0
+
+# ============================================================
+# Framework applicatif
+# ============================================================
+streamlit>=1.32.0,<2.0.0
+
+# ============================================================
+# Manipulation de données
+# ============================================================
+numpy>=1.26.0,<3.0.0
+pandas>=2.1.0,<3.0.0
+pyarrow>=14.0.0              # backend Arrow pour pandas (perf sur gros DataFrames)
+
+# ============================================================
+# Visualisation
+# ============================================================
+plotly>=5.18.0,<7.0.0
+
+# ============================================================
+# Statistiques & Machine Learning
+# ============================================================
+scipy>=1.11.0,<2.0.0
+scikit-learn>=1.3.0,<2.0.0
+joblib>=1.3.0                # dépendance indirecte de scikit-learn (parallélisme)
+
+# ============================================================
+# Dépendances indirectes de Streamlit (utiles pour compatibilité)
+# ============================================================
+altair>=5.0.0,<6.0.0         # utilisé par st.altair_chart
+tornado>=6.3.0               # serveur web sous Streamlit
+click>=8.1.0                 # CLI Streamlit
+packaging>=23.0              # versioning
+
+# ============================================================
+# Compatibilité & robustesse
+# ============================================================
+typing-extensions>=4.8.0     # rétrocompat Python <3.12
+protobuf>=4.24.0             # sérialisation interne Streamlit
+watchdog>=3.0.0              # rechargement à chaud en local
