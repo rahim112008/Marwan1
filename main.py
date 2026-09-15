@@ -2,12 +2,12 @@
 🐄 Bovine SNP Platform
 Pipeline complet de bioinformatique pour puces SNP bovines.
 
-Version 3.3 — Parser PED ADAPTATIF :
-  - Mode AUTO : détection auto du format
-  - Mode MANUEL : séparateur + header + colonnes configurables
-  - Bouton "Analyser le fichier" : aperçu diagnostic
-  - Détection d'encodage (UTF-8, UTF-16, BOM, latin-1)
-  - Tous les modules : PLINK/VCF · NMF · ROH · FST pairwise · Cache
+Version 3.2.1 — Parser PED universel (correction syntaxe) :
+  - Détection automatique du format (texte / gzip / binaire PLINK)
+  - Auto-ajustement du nombre de SNPs (PED ≠ MAP)
+  - Détection du format transposé (--tfile)
+  - Messages d'erreur détaillés avec le nombre de colonnes réel
+  - Rapport ligne par ligne des problèmes rencontrés
 """
 
 import gzip
@@ -45,6 +45,7 @@ DEFAULT_THRESHOLDS = {
 
 HWE_EXACT_MAX_SNP = 20_000
 
+# [MODULE 7] Longueurs chromosomiques ARS-UCD1.2 (bp)
 ARS_UCD12_LENGTHS = {
     "1": 158_534_110, "2": 136_231_102, "3": 121_005_158, "4": 120_000_166,
     "5": 120_089_699, "6": 117_806_340, "7": 110_682_743, "8": 113_384_748,
@@ -66,15 +67,20 @@ BOVINE_AUTOSOMES = [str(i) for i in range(1, 30)]
 def _hash_ndarray(x: np.ndarray):
     if not isinstance(x, np.ndarray) or x.size == 0:
         return ("empty",)
-    return (x.shape, str(x.dtype),
-            float(np.nansum(x)), float(np.nansum(np.abs(x))),
-            float(np.nansum(x * x)))
+    return (
+        x.shape,
+        str(x.dtype),
+        float(np.nansum(x)),
+        float(np.nansum(np.abs(x))),
+        float(np.nansum(x * x)),
+    )
 
 
 HASH_FUNCS = {np.ndarray: _hash_ndarray}
 
 
 def cache_data(func=None, **kw):
+    """Décorateur flexible : @cache_data ou @cache_data(ttl=3600)."""
     def _decorate(f):
         return st.cache_data(
             show_spinner=False, hash_funcs=HASH_FUNCS, **kw)(f)
@@ -115,6 +121,7 @@ def _chr_sort_key(chrom):
 
 
 def _detect_encoding(raw: bytes) -> str:
+    """Détecte si un fichier est gzip, binaire PLINK ou texte."""
     if len(raw) >= 2 and raw[:2] == b"\x1f\x8b":
         return "gzip"
     if len(raw) >= 2 and raw[:2] == b"\x6c\x1b":
@@ -122,34 +129,12 @@ def _detect_encoding(raw: bytes) -> str:
     return "text"
 
 
-def _decode_bytes(raw: bytes) -> tuple:
-    """
-    Décode les bytes en texte avec détection d'encodage.
-    Retourne (texte, encodage_utilisé).
-    """
-    # BOM UTF-16 LE / BE
-    if raw[:2] in (b"\xff\xfe", b"\xfe\xff"):
-        return raw.decode("utf-16"), "UTF-16"
-    # BOM UTF-8
-    if raw[:3] == b"\xef\xbb\xbf":
-        return raw[3:].decode("utf-8"), "UTF-8 (avec BOM)"
-    # Try UTF-8 strict
-    try:
-        return raw.decode("utf-8"), "UTF-8"
-    except UnicodeDecodeError:
-        pass
-    # Try latin-1 (jamais d'erreur)
-    try:
-        return raw.decode("latin-1"), "latin-1"
-    except Exception:
-        return raw.decode("utf-8", errors="replace"), "UTF-8 (replace)"
-
-
 # ============================================================
 # PARSING MAP
 # ============================================================
 
 def parse_map(map_bytes: bytes) -> tuple:
+    """Parse un fichier .map (chr, snp_id, cm, bp). Gère gzip."""
     enc = _detect_encoding(map_bytes)
     if enc == "gzip":
         try:
@@ -158,9 +143,11 @@ def parse_map(map_bytes: bytes) -> tuple:
             raise ValueError(f"Fichier .map.gz corrompu : {e}")
     elif enc == "plink_binary":
         raise ValueError(
-            "❌ Le fichier .map est en binaire PLINK (magic bytes 6C 1B).")
+            "❌ Le fichier .map est en binaire PLINK (magic bytes 6C 1B).\n"
+            "👉 Un .map doit être du texte. Le fichier uploadé est "
+            "probablement un .bed renommé.")
     else:
-        text, _ = _decode_bytes(map_bytes)
+        text = map_bytes.decode("utf-8", errors="replace")
 
     rows, rejected = [], 0
     for line in text.splitlines():
@@ -189,115 +176,38 @@ def parse_map(map_bytes: bytes) -> tuple:
 
 
 # ============================================================
-# PARSING PED — VERSION ADAPTATIVE v3.3
+# PARSING PED — VERSION UNIVERSELLE
 # ============================================================
 
-SEP_OPTIONS = {
-    "Auto": "auto",
-    "Tabulation (\\t)": "\t",
-    "Espace ( )": " ",
-    "Virgule (,)": ",",
-    "Point-virgule (;)": ";",
-}
-
-
-def _detect_separator(line: str) -> str:
-    """Détecte le séparateur dominant dans une ligne."""
-    counts = {
-        "\t": line.count("\t"),
-        " ": line.count(" "),
-        ",": line.count(","),
-        ";": line.count(";"),
-    }
-    sep = max(counts, key=counts.get)
-    if counts[sep] == 0:
-        return " "
-    return sep
-
-
-def _split_line(line: str, sep: str) -> list:
-    if sep == " ":
-        return line.split()
-    return [x.strip() for x in line.split(sep) if x.strip() != ""]
-
-
-def analyze_ped_file(ped_bytes: bytes) -> dict:
-    """
-    Analyse préliminaire d'un fichier PED sans le parser entièrement.
-    Retourne un dict avec les infos de diagnostic.
-    """
-    enc = _detect_encoding(ped_bytes)
-    if enc == "gzip":
-        try:
-            text = gzip.decompress(ped_bytes).decode("utf-8", errors="replace")
-        except Exception as e:
-            return {"error": f"Gzip corrompu : {e}"}
-        encoding_used = "GZIP → UTF-8"
-    elif enc == "plink_binary":
-        return {"error": "Fichier binaire PLINK (.bed renommé)"}
-    else:
-        text, encoding_used = _decode_bytes(ped_bytes)
-
-    all_lines = [l.rstrip("\r\n") for l in text.splitlines()]
-    non_empty = [l for l in all_lines if l.strip()]
-
-    if not non_empty:
-        return {"error": "Fichier vide"}
-
-    # Détecter le séparateur sur les 20 premières lignes
-    sep = " "
-    for line in non_empty[:20]:
-        s = _detect_separator(line)
-        if s != " " or line.count(" ") > 3:
-            sep = s
-            break
-
-    sep_name = {"\t": "tabulation", " ": "espace",
-                ",": "virgule", ";": "point-virgule"}.get(sep, repr(sep))
-
-    # Analyser les 10 premières lignes
-    line_info = []
-    for i, line in enumerate(non_empty[:10]):
-        cols = _split_line(line, sep)
-        line_info.append({
-            "n": i + 1,
-            "n_cols": len(cols),
-            "preview": " ".join(cols[:8])[:120],
-        })
-
-    # Distribution des longueurs sur 100 premières lignes
-    lengths = Counter()
-    for line in non_empty[:100]:
-        lengths[len(_split_line(line, sep))] += 1
-
+def _diagnose_ped_first_line(line: str, n_snp_map: int) -> dict:
+    """Analyse la 1ère ligne pour diagnostiquer le format."""
+    parts = line.split()
+    n_cols = len(parts)
     return {
-        "ok": True,
-        "encoding": encoding_used,
-        "separator": sep,
-        "separator_name": sep_name,
-        "n_lines_total": len(non_empty),
-        "n_lines_empty": len(all_lines) - len(non_empty),
-        "line_info": line_info,
-        "lengths_distribution": lengths.most_common(8),
+        "n_cols": n_cols,
+        "first_cols": parts[:10],
+        "expected_cols": 6 + 2 * n_snp_map,
+        "n_snp_inferred": max(0, (n_cols - 6) // 2),
+        "looks_like_ped": n_cols >= 7 and parts[2] in ("0", "1", "2", "3",
+                                                       "-9", "."),
     }
 
 
-def parse_ped(ped_bytes: bytes, n_snp_map: int,
-              manual_params: dict = None) -> tuple:
+def parse_ped(ped_bytes: bytes, n_snp_map: int) -> tuple:
     """
-    Parser PED ADAPTATIF v3.3.
+    Parser PED universel et robuste.
 
-    manual_params (optionnel) :
-        {
-            "separator": "auto" | "\t" | " " | "," | ";",
-            "header_lines": int | "auto",   # lignes à skipper
-            "metadata_cols": int,            # colonnes avant génotypes
-            "expected_cols": int | "auto",   # total colonnes attendues
-        }
+    Gère :
+      - PED standard (texte, 6 + 2*N colonnes)
+      - Fichier gzippé (.ped.gz)
+      - Binaire PLINK renommé en .ped (erreur claire)
+      - Désalignement PED / MAP (auto-ajustement)
+      - Format transposé (1 SNP par ligne → erreur explicite)
+      - Fichier tronqué (rapport des lignes rejetées)
+
+    Retourne : (gt, ind_df, n_rejected)
     """
-    manual_params = manual_params or {}
-
-    # --- 1. Encodage ---
+    # --- 1. Détection encodage ---
     enc = _detect_encoding(ped_bytes)
     if enc == "gzip":
         try:
@@ -306,154 +216,110 @@ def parse_ped(ped_bytes: bytes, n_snp_map: int,
             raise ValueError(f"Fichier .ped.gz corrompu : {e}")
     elif enc == "plink_binary":
         raise ValueError(
-            "❌ Fichier PLINK binaire (.bed) renommé en .ped.\n"
-            "👉 Convertissez : plink --bfile PREFIX --recode --out PREFIX")
+            "❌ Ce fichier est un PLINK binaire (.bed) renommé en .ped.\n"
+            "👉 Conversions possibles :\n"
+            "   • PLINK :  plink --bfile PREFIX --recode --out PREFIX\n"
+            "   • Python : utilisez le parser .bed natif (module séparé)\n"
+            "   • Ou renommez-le en .bed et utilisez un autre outil.")
     else:
-        text, _ = _decode_bytes(ped_bytes)
+        text = ped_bytes.decode("utf-8", errors="replace")
 
-    # --- 2. Lecture ---
-    non_empty = [l.rstrip("\r\n") for l in text.splitlines() if l.strip()]
-    if not non_empty:
+    # --- 2. Lecture brute des lignes ---
+    lines = [l.strip() for l in text.splitlines() if l.strip()]
+    if not lines:
         raise ValueError("Fichier .ped vide.")
 
-    # --- 3. Séparateur ---
-    sep_choice = manual_params.get("separator", "auto")
-    if sep_choice == "auto":
-        # Détection auto
-        sep = " "
-        for line in non_empty[:20]:
-            s = _detect_separator(line)
-            if s != " ":
-                sep = s
-                break
-    else:
-        sep = sep_choice
+    # --- 3. Diagnostic 1ère ligne ---
+    diag = _diagnose_ped_first_line(lines[0], n_snp_map)
+    n_cols_first = diag["n_cols"]
+    n_snp_ped = diag["n_snp_inferred"]
 
-    sep_name = {"\t": "tabulation", " ": "espace",
-                ",": "virgule", ";": "point-virgule"}.get(sep, repr(sep))
+    # Cas particulier : trop peu de colonnes
+    if n_cols_first < 7:
+        raise ValueError(
+            f"❌ Format PED invalide.\n"
+            f"   La 1ère ligne contient seulement {n_cols_first} colonnes.\n"
+            f"   Un PED standard doit avoir au minimum 7 colonnes "
+            f"(FID, IID, PID, MID, SEX, PHENO + génotypes).\n"
+            f"   → Vérifiez le séparateur (espaces/tabulations) ou le format.")
 
-    # --- 4. Header ---
-    header_choice = manual_params.get("header_lines", "auto")
-    if header_choice == "auto":
-        header_skip = 0
-        for i, line in enumerate(non_empty[:50]):
-            cols = _split_line(line, sep)
-            if len(cols) >= 7:
-                header_skip = i
-                break
-    else:
-        header_skip = int(header_choice)
+    # Cas particulier : format transposé (--tfile)
+    if 0 < n_snp_ped < 10 and len(lines) > 100:
+        raise ValueError(
+            f"⚠️ Fichier probablement au format TRANSPOSÉ (--tfile).\n"
+            f"   {len(lines)} lignes × {n_cols_first} colonnes "
+            f"→ 1 SNP par ligne au lieu de 1 individu par ligne.\n"
+            f"   👉 Convertissez avec : "
+            f"plink --tfile PREFIX --recode --out PREFIX")
 
-    if header_skip > 0:
-        st.info(f"ℹ️ {header_skip} ligne(s) d'en-tête ignorée(s)")
-
-    working_lines = non_empty[header_skip:]
-    if not working_lines:
-        raise ValueError("Toutes les lignes ont été ignorées comme header.")
-
-    # --- 5. Colonnes ---
-    meta_cols = int(manual_params.get("metadata_cols", 6))
-    expected_choice = manual_params.get("expected_cols", "auto")
-
-    # Analyser la 1ère ligne réellement utilisable
-    first_cols = _split_line(working_lines[0], sep)
-    n_cols_first = len(first_cols)
-
-    if expected_choice == "auto":
-        # Détecter le nombre de colonnes le plus fréquent
-        lengths = Counter()
-        for line in working_lines[:200]:
-            lengths[len(_split_line(line, sep))] += 1
-        if lengths:
-            n_cols_observed = lengths.most_common(1)[0][0]
-        else:
-            n_cols_observed = n_cols_first
-
-        # Le PED a meta_cols + 2*n_snp colonnes
-        n_snp_ped = max(0, (n_cols_observed - meta_cols) // 2)
-        expected_cols_eff = meta_cols + 2 * n_snp_ped
-    else:
-        expected_cols_eff = int(expected_choice)
-        n_snp_ped = max(0, (expected_cols_eff - meta_cols) // 2)
-
-    # --- 6. Ajustement ---
+    # --- 4. Auto-ajustement du nombre de SNPs ---
     if n_snp_ped != n_snp_map and n_snp_ped > 0:
-        n_snp_eff = min(n_snp_map, n_snp_ped)
         st.warning(
-            f"⚠️ Désalignement PED / MAP\n"
+            f"⚠️ Désalignement PED / MAP détecté\n"
             f"   • MAP : **{n_snp_map}** SNPs\n"
-            f"   • PED : **{n_snp_ped}** SNPs (colonnes : {expected_cols_eff})\n"
-            f"   → Utilisation de **{n_snp_eff}** SNPs communs.")
+            f"   • PED : **{n_snp_ped}** SNPs (déduit de la 1ère ligne)\n"
+            f"   → Utilisation de **{min(n_snp_map, n_snp_ped)}** SNPs communs.")
+        n_snp_eff = min(n_snp_map, n_snp_ped)
     else:
         n_snp_eff = n_snp_map
 
-    expected_cols_final = meta_cols + 2 * n_snp_eff
-    geno_start = meta_cols  # index de début des génotypes
+    expected_cols_eff = 6 + 2 * n_snp_eff
 
-    # --- 7. Parse ---
+    # --- 5. Filtrage des lignes valides ---
     fids, iids, geno_rows = [], [], []
     rejected_short = 0
     rejected_empty = 0
     lengths_seen = Counter()
 
-    for line in working_lines:
-        cols = _split_line(line, sep)
-        lengths_seen[len(cols)] += 1
-        if len(cols) < meta_cols + 2:
+    for line in lines:
+        parts = line.split()
+        lengths_seen[len(parts)] += 1
+        if len(parts) < 7:
             rejected_empty += 1
             continue
-        if len(cols) < expected_cols_final:
+        if len(parts) < expected_cols_eff:
             rejected_short += 1
             continue
-        # FID et IID = 2 premières colonnes (ou fallback si meta < 2)
-        if meta_cols >= 2:
-            fids.append(cols[0])
-            iids.append(cols[1])
-        else:
-            fids.append(f"IND_{len(fids)}")
-            iids.append(f"IND_{len(fids)}")
-        geno_rows.append(cols[geno_start:geno_start + 2 * n_snp_eff])
+        fids.append(parts[0])
+        iids.append(parts[1])
+        geno_rows.append(parts[6:6 + 2 * n_snp_eff])
 
     n_ind = len(iids)
 
-    # --- 8. Diagnostic si échec ---
+    # --- 6. Rapport d'erreur détaillé si échec complet ---
     if n_ind == 0:
-        top_lengths = lengths_seen.most_common(5)
-        top_str = "\n".join(
-            [f"  • {length} cols : {count} lignes"
+        top_lengths = lengths_seen.most_common(3)
+        top_str = ", ".join(
+            [f"{length} cols x {count} lignes"
              for length, count in top_lengths])
-        sample_show = "\n".join(
-            [f"  L{l+1} : {':'.join(l.split()[:8])[:100]}"
-             for l in range(min(3, len(working_lines)))])
-        raise ValueError(
-            f"❌ Aucun individu chargé.\n\n"
-            f"**Diagnostic :**\n"
-            f"• Séparateur : **{sep_name}**\n"
-            f"• Header skip : **{header_skip}**\n"
-            f"• Méta-colonnes : **{meta_cols}**\n"
-            f"• Colonnes attendues : **{expected_cols_final}**\n"
-            f"• 1ère ligne : **{n_cols_first}** colonnes\n"
-            f"• Lignes trop courtes : **{rejected_short}**\n"
-            f"• Lignes quasi-vides : **{rejected_empty}**\n\n"
-            f"**Distribution des longueurs :**\n{top_str}\n\n"
-            f"**Aperçu :**\n{sample_show}\n\n"
-            f"**💡 Solutions :**\n"
-            f"1. Utilisez le **Mode Manuel** dans la sidebar\n"
-            f"2. Changez le séparateur (Tabulation / Espace / Virgule)\n"
-            f"3. Ajustez le nombre de lignes d'en-tête\n"
-            f"4. Vérifiez que le .ped correspond bien au .map")
+
+        error_msg = (
+            "❌ Aucun individu chargé.\n\n"
+            "**Diagnostic automatique :**\n"
+            f"• Nombre de SNPs dans le MAP : **{n_snp_map}**\n"
+            f"• Colonnes attendues par ligne : **{expected_cols_eff}**\n"
+            f"• 1ère ligne PED : **{n_cols_first}** colonnes\n"
+            f"• Longueurs les plus fréquentes : {top_str}\n"
+            f"• Lignes trop courtes : {rejected_short}\n"
+            f"• Lignes quasi-vides : {rejected_empty}\n\n"
+            "**Causes probables :**\n"
+            "1. Le fichier est **tronqué** (upload interrompu)\n"
+            "2. Le **PED et le MAP ne correspondent pas**\n"
+            "3. Le séparateur n'est pas un espace\n"
+            "4. Le fichier n'est pas en format PLINK PED (ex: VCF, CSV)")
+        raise ValueError(error_msg)
 
     if rejected_short > 0:
         st.warning(
-            f"⚠️ {rejected_short} ligne(s) ignorée(s) — moins de "
-            f"{expected_cols_final} colonnes.")
+            f"⚠️ {rejected_short} ligne(s) ignorée(s) — colonnes "
+            f"manquantes (< {expected_cols_eff}).")
 
-    # --- 9. Passe 1 : comptage allèles ---
+    # --- 7. Passe 1 : comptage des allèles ---
     allele_counts = [Counter() for _ in range(n_snp_eff)]
     for row in geno_rows:
         for j in range(n_snp_eff):
             a1, a2 = row[2 * j], row[2 * j + 1]
-            if a1 in ("0", "N", ".", "") or a2 in ("0", "N", ".", ""):
+            if a1 == "0" or a2 == "0":
                 continue
             c = allele_counts[j]
             c[a1] += 1
@@ -465,7 +331,7 @@ def parse_ped(ped_bytes: bytes, n_snp_map: int,
             continue
         minor[j] = min(c, key=c.get)
 
-    # --- 10. Passe 2 : dosage 0/1/2 ---
+    # --- 8. Passe 2 : dosage 0/1/2 de l'allèle mineur ---
     gt = np.full((n_ind, n_snp_eff), np.nan, dtype=np.float32)
     for i, row in enumerate(geno_rows):
         for j in range(n_snp_eff):
@@ -473,14 +339,18 @@ def parse_ped(ped_bytes: bytes, n_snp_map: int,
             if m is None:
                 continue
             a1, a2 = row[2 * j], row[2 * j + 1]
-            if a1 in ("0", "N", ".", "") or a2 in ("0", "N", ".", ""):
+            if a1 == "0" or a2 == "0":
                 continue
             gt[i, j] = (1 if a1 == m else 0) + (1 if a2 == m else 0)
 
     ind_df = pd.DataFrame({"FID": fids, "IID": iids})
 
+    # --- 9. Alignement avec le MAP ---
     if n_snp_eff < n_snp_map:
-        st.info(f"ℹ️ MAP tronqué à {n_snp_eff} SNPs (au lieu de {n_snp_map})")
+        st.info(
+            f"ℹ️ Le MAP contenait {n_snp_map} SNPs, mais seulement "
+            f"{n_snp_eff} ont été chargés. Les SNPs excédentaires seront "
+            f"ignorés automatiquement.")
 
     return gt, ind_df, rejected_short + rejected_empty
 
@@ -490,6 +360,7 @@ def parse_ped(ped_bytes: bytes, n_snp_map: int,
 # ============================================================
 
 def parse_vcf(vcf_bytes: bytes) -> tuple:
+    """Parse VCF (gzip auto-détecté), variants bialléliques."""
     is_gz = len(vcf_bytes) >= 2 and vcf_bytes[:2] == b"\x1f\x8b"
     if is_gz:
         try:
@@ -562,6 +433,7 @@ def parse_vcf(vcf_bytes: bytes) -> tuple:
     for j, r in enumerate(rows):
         gt[:, j] = r["GT"]
 
+    # Flip : dosage 2 = homozygote allèle mineur
     for j in range(n_snp):
         col = gt[:, j]
         valid = col[~np.isnan(col)]
@@ -587,7 +459,8 @@ def parse_vcf(vcf_bytes: bytes) -> tuple:
 # DONNÉES DE DÉMONSTRATION
 # ============================================================
 
-def generate_demo_data(n_ind=150, n_snp=800, n_pop=4, seed=42) -> tuple:
+def generate_demo_data(n_ind: int = 150, n_snp: int = 800,
+                       n_pop: int = 4, seed: int = 42) -> tuple:
     rng = np.random.default_rng(seed)
     pool_names = ["AND", "EBG", "ELN", "EZP", "FGN", "LJR", "NAR",
                   "NBD", "NKA", "PRS", "PSH", "PTP", "SHO", "YBS"]
@@ -623,7 +496,8 @@ def generate_demo_data(n_ind=150, n_snp=800, n_pop=4, seed=42) -> tuple:
     snp_df = pd.DataFrame({
         "CHR": chr_names,
         "SNP": [f"rs{i:07d}" for i in range(n_snp)],
-        "CM": 0.0, "BP": bps,
+        "CM": 0.0,
+        "BP": bps,
     })
     snp_df["_k"] = snp_df["CHR"].map(_chr_sort_key)
     snp_df = (snp_df.sort_values(["_k", "BP"])
@@ -635,9 +509,16 @@ def generate_demo_data(n_ind=150, n_snp=800, n_pop=4, seed=42) -> tuple:
 # QC — MÉTRIQUES
 # ============================================================
 
-def missingness_per_ind(gt): return np.isnan(gt).mean(axis=1)
-def missingness_per_snp(gt): return np.isnan(gt).mean(axis=0)
-def allele_freq(gt): return np.nanmean(gt, axis=0) / 2.0
+def missingness_per_ind(gt):
+    return np.isnan(gt).mean(axis=1)
+
+
+def missingness_per_snp(gt):
+    return np.isnan(gt).mean(axis=0)
+
+
+def allele_freq(gt):
+    return np.nanmean(gt, axis=0) / 2.0
 
 
 def maf(gt):
@@ -650,7 +531,7 @@ def heterozygosity(gt):
         return np.nanmean(gt == 1, axis=1)
 
 
-def hwe_exact_p(n_het, n_hom1, n_hom2):
+def hwe_exact_p(n_het: int, n_hom1: int, n_hom2: int) -> float:
     n = n_het + n_hom1 + n_hom2
     if n == 0:
         return np.nan
@@ -660,15 +541,23 @@ def hwe_exact_p(n_het, n_hom1, n_hom2):
     mid = (rare * (2 * n - rare)) // (2 * n)
     if mid % 2 != rare % 2:
         mid += 1
-    probs = np.zeros(rare + 1); probs[mid] = 1.0; mysum = 1.0
+    probs = np.zeros(rare + 1)
+    probs[mid] = 1.0
+    mysum = 1.0
     ch, chr_, chc = mid, (rare - mid) // 2, n - mid - (rare - mid) // 2
     while ch <= rare - 2:
         probs[ch + 2] = probs[ch] * 4 * chr_ * chc / ((ch + 2) * (ch + 1))
-        mysum += probs[ch + 2]; ch += 2; chr_ -= 1; chc -= 1
+        mysum += probs[ch + 2]
+        ch += 2
+        chr_ -= 1
+        chc -= 1
     ch, chr_, chc = mid, (rare - mid) // 2, n - mid - (rare - mid) // 2
     while ch >= 2:
         probs[ch - 2] = probs[ch] * ch * (ch - 1) / (4 * (chr_ + 1) * (chc + 1))
-        mysum += probs[ch - 2]; ch -= 2; chr_ += 1; chc += 1
+        mysum += probs[ch - 2]
+        ch -= 2
+        chr_ += 1
+        chc += 1
     p_obs = probs[n_het] if n_het < len(probs) else 0.0
     return float(min(probs[probs <= p_obs + 1e-7].sum() / mysum, 1.0))
 
@@ -720,23 +609,27 @@ def apply_qc_filters(gt, ind_df, snp_df, params):
     n0, m0 = gt.shape
 
     keep_snp = missingness_per_snp(gt) <= params["geno"]
-    gt = gt[:, keep_snp]; snp_df = snp_df[keep_snp].reset_index(drop=True)
+    gt = gt[:, keep_snp]
+    snp_df = snp_df[keep_snp].reset_index(drop=True)
 
     keep_ind = missingness_per_ind(gt) <= params["mind"]
-    gt = gt[keep_ind]; ind_df = ind_df[keep_ind].reset_index(drop=True)
+    gt = gt[keep_ind]
+    ind_df = ind_df[keep_ind].reset_index(drop=True)
 
     if gt.shape[1] == 0 or gt.shape[0] == 0:
         raise ValueError("Tous les SNPs ou individus exclus (missingness).")
 
     m = maf(gt)
     keep_maf = np.isfinite(m) & (m >= params["maf"])
-    gt = gt[:, keep_maf]; snp_df = snp_df[keep_maf].reset_index(drop=True)
+    gt = gt[:, keep_maf]
+    snp_df = snp_df[keep_maf].reset_index(drop=True)
     if gt.shape[1] == 0:
         raise ValueError("Tous les SNPs exclus par MAF.")
 
     pv = hwe_pvalues(gt)
     keep_hwe = np.isnan(pv) | (pv >= params["hwe"])
-    gt = gt[:, keep_hwe]; snp_df = snp_df[keep_hwe].reset_index(drop=True)
+    gt = gt[:, keep_hwe]
+    snp_df = snp_df[keep_hwe].reset_index(drop=True)
     if gt.shape[1] == 0:
         raise ValueError("Tous les SNPs exclus par HWE.")
 
@@ -746,7 +639,8 @@ def apply_qc_filters(gt, ind_df, snp_df, params):
         keep_het = np.abs(z) <= params["het_sd"]
     else:
         keep_het = np.ones_like(het, dtype=bool)
-    gt = gt[keep_het]; ind_df = ind_df[keep_het].reset_index(drop=True)
+    gt = gt[keep_het]
+    ind_df = ind_df[keep_het].reset_index(drop=True)
     if gt.shape[0] == 0:
         raise ValueError("Tous les individus exclus par hétérozygotie.")
 
@@ -776,7 +670,8 @@ def fst_per_snp(gt: np.ndarray, pop_labels: np.ndarray) -> np.ndarray:
             vals = vals[~np.isnan(vals)]
             if len(vals) < 3:
                 continue
-            p_list.append(vals.mean() / 2.0); n_list.append(len(vals))
+            p_list.append(vals.mean() / 2.0)
+            n_list.append(len(vals))
         if len(p_list) < 2:
             continue
         p_arr, n_arr = np.asarray(p_list), np.asarray(n_list)
@@ -795,16 +690,19 @@ def fst_pairwise(gt: np.ndarray, pop_labels: np.ndarray) -> tuple:
     matrix = np.full((K, K), np.nan)
     np.fill_diagonal(matrix, 0.0)
     masks = {p: (pop_labels == p) for p in pops}
+
     for i in range(K):
         for j in range(i + 1, K):
-            g1 = gt[masks[pops[i]]]; g2 = gt[masks[pops[j]]]
+            g1 = gt[masks[pops[i]]]
+            g2 = gt[masks[pops[j]]]
             p1 = np.nanmean(g1, axis=0) / 2.0
             p2 = np.nanmean(g2, axis=0) / 2.0
             n1 = (~np.isnan(g1)).sum(axis=0)
             n2 = (~np.isnan(g2)).sum(axis=0)
             denom = np.where(n1 + n2 > 0, n1 + n2, np.nan)
             p_bar = (p1 * n1 + p2 * n2) / denom
-            h_s1 = 2.0 * p1 * (1.0 - p1); h_s2 = 2.0 * p2 * (1.0 - p2)
+            h_s1 = 2.0 * p1 * (1.0 - p1)
+            h_s2 = 2.0 * p2 * (1.0 - p2)
             hs = (h_s1 * n1 + h_s2 * n2) / denom
             ht = 2.0 * p_bar * (1.0 - p_bar)
             with np.errstate(divide="ignore", invalid="ignore"):
@@ -815,7 +713,8 @@ def fst_pairwise(gt: np.ndarray, pop_labels: np.ndarray) -> tuple:
 
 @cache_data
 def pca_analysis(gt: np.ndarray, n_components: int = 10) -> tuple:
-    X = impute_mean(gt); X = X - X.mean(axis=0)
+    X = impute_mean(gt)
+    X = X - X.mean(axis=0)
     n_comp = min(n_components, X.shape[0] - 1, X.shape[1])
     pca = PCA(n_components=n_comp)
     scores = pca.fit_transform(X)
@@ -824,7 +723,8 @@ def pca_analysis(gt: np.ndarray, n_components: int = 10) -> tuple:
 
 @cache_data
 def mds_analysis(gt: np.ndarray, n_components: int = 5) -> np.ndarray:
-    X = impute_mean(gt); n = X.shape[0]
+    X = impute_mean(gt)
+    n = X.shape[0]
     D = np.zeros((n, n), dtype=np.float32)
     for i in range(n):
         D[i] = np.abs(X - X[i]).sum(axis=1) / X.shape[1]
@@ -847,9 +747,11 @@ def ld_decay(gt: np.ndarray, snp_bp: np.ndarray,
     gt_sub = impute_mean(gt[:, idx])
     bp_sub = snp_bp[idx].astype(np.float64)
     X = gt_sub - gt_sub.mean(axis=0)
-    std = gt_sub.std(axis=0); std[std < 1e-8] = np.nan
+    std = gt_sub.std(axis=0)
+    std[std < 1e-8] = np.nan
     X = X / std
-    C = (X.T @ X) / X.shape[0]; R2 = C ** 2
+    C = (X.T @ X) / X.shape[0]
+    R2 = C ** 2
     iu, ju = np.triu_indices(len(idx), k=1)
     dist_kb = (bp_sub[ju] - bp_sub[iu]) / 1000.0
     mask = (dist_kb > 0) & (dist_kb <= max_kb)
@@ -867,6 +769,10 @@ def kinship_matrix(gt: np.ndarray) -> np.ndarray:
     return (Zn @ Zn.T) / X.shape[1]
 
 
+# ============================================================
+# [MODULE 2] ADMIXTURE NMF
+# ============================================================
+
 @cache_data
 def admixture_nmf(gt: np.ndarray, K: int = 3, seed: int = 42,
                   max_iter: int = 500) -> tuple:
@@ -874,9 +780,14 @@ def admixture_nmf(gt: np.ndarray, K: int = 3, seed: int = 42,
     model = NMF(n_components=K, init="nndsvda", random_state=seed,
                 max_iter=max_iter)
     W = model.fit_transform(X)
-    s = W.sum(axis=1, keepdims=True); s[s == 0] = 1.0
+    s = W.sum(axis=1, keepdims=True)
+    s[s == 0] = 1.0
     return W / s, model.components_
 
+
+# ============================================================
+# [MODULE 3] ROH
+# ============================================================
 
 @cache_data
 def detect_roh(gt: np.ndarray, snp_df_json: str,
@@ -884,21 +795,27 @@ def detect_roh(gt: np.ndarray, snp_df_json: str,
     snp_df = pd.read_json(snp_df_json)
     chr_arr = snp_df["CHR"].astype(str).values
     bp = snp_df["BP"].astype(np.int64).values
+
     n_ind = gt.shape[0]
-    rohs = []; froh_bp = np.zeros(n_ind, dtype=np.float64)
+    rohs = []
+    froh_bp = np.zeros(n_ind, dtype=np.float64)
     genome_bp_total = 0.0
+
     for chrom in pd.unique(chr_arr):
         mask = chr_arr == chrom
         idxs = np.where(mask)[0]
         if len(idxs) < min_snps:
             continue
-        order = np.argsort(bp[idxs]); idxs = idxs[order]
+        order = np.argsort(bp[idxs])
+        idxs = idxs[order]
         chrom_span = bp[idxs[-1]] - bp[idxs[0]]
         if chrom_span < 1:
             continue
         genome_bp_total += chrom_span
+
         for i in range(n_ind):
-            col = gt[i, idxs]; start_k = None
+            col = gt[i, idxs]
+            start_k = None
             for k in range(len(idxs)):
                 is_hom = (col[k] == 0) or (col[k] == 2)
                 if is_hom:
@@ -915,7 +832,8 @@ def detect_roh(gt: np.ndarray, snp_df_json: str,
                                 "start_bp": int(bp[idxs[start_k]]),
                                 "end_bp": int(bp[idxs[k - 1]]),
                                 "n_snp": int(n_run),
-                                "length_kb": float(length_kb)})
+                                "length_kb": float(length_kb),
+                            })
                             froh_bp[i] += bp[idxs[k - 1]] - bp[idxs[start_k]]
                         start_k = None
             if start_k is not None:
@@ -927,8 +845,10 @@ def detect_roh(gt: np.ndarray, snp_df_json: str,
                         "start_bp": int(bp[idxs[start_k]]),
                         "end_bp": int(bp[idxs[-1]]),
                         "n_snp": int(n_run),
-                        "length_kb": float(length_kb)})
+                        "length_kb": float(length_kb),
+                    })
                     froh_bp[i] += bp[idxs[-1]] - bp[idxs[start_k]]
+
     froh = froh_bp / genome_bp_total if genome_bp_total > 0 else froh_bp
     roh_df = (pd.DataFrame(rohs) if rohs else pd.DataFrame(
         columns=["IID_idx", "CHR", "start_bp", "end_bp", "n_snp", "length_kb"]))
@@ -940,9 +860,12 @@ def detect_roh(gt: np.ndarray, snp_df_json: str,
 # ============================================================
 
 def _dosage_to_plink_bits(col: np.ndarray) -> np.ndarray:
-    n = len(col); bits = np.zeros(n, dtype=np.uint8)
+    n = len(col)
+    bits = np.zeros(n, dtype=np.uint8)
     bits[np.isnan(col)] = 0b01
-    bits[col == 0] = 0b11; bits[col == 1] = 0b10; bits[col == 2] = 0b00
+    bits[col == 0] = 0b11
+    bits[col == 1] = 0b10
+    bits[col == 2] = 0b00
     return bits
 
 
@@ -959,58 +882,72 @@ def build_plink_bed(gt: np.ndarray) -> bytes:
     return bytes(buf)
 
 
-def build_plink_bim(snp_df):
+def build_plink_bim(snp_df: pd.DataFrame) -> str:
     lines = []
     has_a1 = "A1" in snp_df.columns
     has_a2 = "A2" in snp_df.columns
     for _, r in snp_df.iterrows():
         a1 = str(r["A1"]) if has_a1 else "A"
         a2 = str(r["A2"]) if has_a2 else "G"
-        if a1 in ("nan", ""): a1 = "A"
-        if a2 in ("nan", "", a1): a2 = "G" if a1 == "A" else "A"
+        if a1 in ("nan", ""):
+            a1 = "A"
+        if a2 in ("nan", "", a1):
+            a2 = "G" if a1 == "A" else "A"
         lines.append(f"{r['CHR']}\t{r['SNP']}\t{r['CM']}\t"
                      f"{int(r['BP'])}\t{a1}\t{a2}")
     return "\n".join(lines) + "\n"
 
 
-def build_plink_fam(ind_df):
+def build_plink_fam(ind_df: pd.DataFrame) -> str:
     lines = []
     for _, r in ind_df.iterrows():
         lines.append(f"{r['FID']}\t{r['IID']}\t0\t0\t0\t-9")
     return "\n".join(lines) + "\n"
 
 
-def build_vcf_output(gt, ind_df, snp_df, project="BovineSNP"):
+def build_vcf_output(gt: np.ndarray, ind_df: pd.DataFrame,
+                     snp_df: pd.DataFrame, project: str = "BovineSNP") -> str:
     n_ind, n_snp = gt.shape
-    has_a1 = "A1" in snp_df.columns; has_a2 = "A2" in snp_df.columns
-    header = ["##fileformat=VCFv4.2",
-              f"##source=BovineSNPPlatform-{project}",
-              f"##fileDate={datetime.now():%Y%m%d}",
-              '##FORMAT=<ID=GT,Number=1,Type=String,Description="Genotype">']
+    has_a1 = "A1" in snp_df.columns
+    has_a2 = "A2" in snp_df.columns
+    header = [
+        "##fileformat=VCFv4.2",
+        f"##source=BovineSNPPlatform-{project}",
+        f"##fileDate={datetime.now():%Y%m%d}",
+        '##FORMAT=<ID=GT,Number=1,Type=String,Description="Genotype">',
+    ]
     samples = ind_df["IID"].astype(str).tolist()
     header.append("#CHROM\tPOS\tID\tREF\tALT\tQUAL\tFILTER\tINFO\tFORMAT\t"
                   + "\t".join(samples))
+
     body = []
     for j in range(n_snp):
         r = snp_df.iloc[j]
         ref = str(r["A1"]) if has_a1 else "A"
         alt = str(r["A2"]) if has_a2 else "G"
-        if ref in ("nan", ""): ref = "A"
-        if alt in ("nan", "", ref): alt = "G" if ref == "A" else "A"
+        if ref in ("nan", ""):
+            ref = "A"
+        if alt in ("nan", "", ref):
+            alt = "G" if ref == "A" else "A"
         gts = []
         for i in range(n_ind):
             v = gt[i, j]
-            if np.isnan(v): gts.append("./.")
-            elif v == 0: gts.append("0/0")
-            elif v == 1: gts.append("0/1")
-            else: gts.append("1/1")
+            if np.isnan(v):
+                gts.append("./.")
+            elif v == 0:
+                gts.append("0/0")
+            elif v == 1:
+                gts.append("0/1")
+            else:
+                gts.append("1/1")
         body.append(f"{r['CHR']}\t{int(r['BP'])}\t{r['SNP']}\t{ref}\t{alt}"
                     f"\t.\tPASS\t.\tGT\t" + "\t".join(gts))
     return "\n".join(header + body) + "\n"
 
 
-def build_plink_zip(gt, ind_df, snp_df, prefix="bovine_qc"):
-    bed = build_plink_bed(gt); bim = build_plink_bim(snp_df)
+def build_plink_zip(gt, ind_df, snp_df, prefix="bovine_qc") -> bytes:
+    bed = build_plink_bed(gt)
+    bim = build_plink_bim(snp_df)
     fam = build_plink_fam(ind_df)
     bio = BytesIO()
     with zipfile.ZipFile(bio, "w", zipfile.ZIP_DEFLATED) as zf:
@@ -1052,9 +989,10 @@ def plot_missingness_dashboard(miss_ind, miss_snp):
 def plot_pca(scores, var_pct, labels):
     df = pd.DataFrame({"PC1": scores[:, 0], "PC2": scores[:, 1],
                        "Population": labels})
-    fig = px.scatter(df, x="PC1", y="PC2", color="Population",
-                     title=(f"PCA — PC1 ({var_pct[0]:.1f}%) vs "
-                            f"PC2 ({var_pct[1]:.1f}%)"), height=550)
+    fig = px.scatter(
+        df, x="PC1", y="PC2", color="Population",
+        title=(f"PCA — PC1 ({var_pct[0]:.1f}%) vs "
+               f"PC2 ({var_pct[1]:.1f}%)"), height=550)
     fig.update_traces(marker=dict(size=10, line=dict(width=1, color="white")))
     fig.update_layout(margin=dict(l=40, r=20, t=60, b=40))
     return fig
@@ -1064,7 +1002,8 @@ def plot_mds(coords, labels):
     df = pd.DataFrame({"MDS1": coords[:, 0], "MDS2": coords[:, 1],
                        "Population": labels})
     fig = px.scatter(df, x="MDS1", y="MDS2", color="Population",
-                     title="MDS (IBS) — Structure des populations", height=550)
+                     title="MDS (IBS) — Structure des populations",
+                     height=550)
     fig.update_traces(marker=dict(size=10, line=dict(width=1, color="white")))
     fig.update_layout(margin=dict(l=40, r=20, t=60, b=40))
     return fig
@@ -1073,19 +1012,24 @@ def plot_mds(coords, labels):
 def plot_manhattan(fst, chr_col, threshold_q=0.999):
     df = pd.DataFrame({"FST": np.asarray(fst), "CHR": np.asarray(chr_col)})
     df = df.dropna(subset=["FST"]).reset_index(drop=True)
-    if df.empty: return None
+    if df.empty:
+        return None
     order = df["CHR"].map(_chr_sort_key)
     df["_k0"] = order.map(lambda t: t[0])
     df["_k1"] = order.map(lambda t: t[1])
     df["_k2"] = order.map(lambda t: t[2])
     df = df.sort_values(["_k0", "_k1", "_k2"]).reset_index(drop=True)
+
     cumulative, ticks, labels = 0, [], []
     cum_positions = np.zeros(len(df), dtype=int)
     for chrom in df["CHR"].unique():
         sub_idx = df.index[df["CHR"] == chrom]
         s, e = cumulative, cumulative + len(sub_idx)
         cum_positions[s:e] = np.arange(s, e)
-        ticks.append((s + e) / 2); labels.append(str(chrom)); cumulative = e
+        ticks.append((s + e) / 2)
+        labels.append(str(chrom))
+        cumulative = e
+
     df["x"] = cum_positions
     fig = go.Figure()
     unique_chrs = list(df["CHR"].unique())
@@ -1109,8 +1053,10 @@ def plot_manhattan(fst, chr_col, threshold_q=0.999):
 
 
 def plot_ld_decay(ld_df, bin_kb=20):
-    if ld_df is None or ld_df.empty: return None
-    d = ld_df.copy(); d["bin"] = (d["dist_kb"] // bin_kb) * bin_kb
+    if ld_df is None or ld_df.empty:
+        return None
+    d = ld_df.copy()
+    d["bin"] = (d["dist_kb"] // bin_kb) * bin_kb
     agg = d.groupby("bin")["r2"].mean().reset_index()
     fig = px.line(agg, x="bin", y="r2",
                   labels={"bin": "Distance (kb)", "r2": "r² moyen"},
@@ -1121,16 +1067,19 @@ def plot_ld_decay(ld_df, bin_kb=20):
 
 
 def plot_kinship_heatmap(G, labels):
-    labels = [str(x) for x in labels]; n = len(labels)
+    labels = [str(x) for x in labels]
+    n = len(labels)
     seen, uniq = {}, []
     for lab in labels:
         seen[lab] = seen.get(lab, 0) + 1
         uniq.append(lab if seen[lab] == 1 else f"{lab}#{seen[lab]}")
-    vmin = float(np.nanpercentile(G, 1)); vmax = float(np.nanpercentile(G, 99))
+    vmin = float(np.nanpercentile(G, 1))
+    vmax = float(np.nanpercentile(G, 99))
     if not np.isfinite(vmin) or not np.isfinite(vmax) or vmin == vmax:
         vmin, vmax = -0.3, 0.5
-    custom = np.stack([np.repeat(uniq, n).reshape(n, n),
-                       np.tile(uniq, n).reshape(n, n)], axis=-1)
+    custom = np.stack(
+        [np.repeat(uniq, n).reshape(n, n),
+         np.tile(uniq, n).reshape(n, n)], axis=-1)
     fig = go.Figure(data=go.Heatmap(
         z=G, colorscale="RdBu", zmid=0.0, zmin=vmin, zmax=vmax,
         colorbar=dict(title="GRM"),
@@ -1147,12 +1096,15 @@ def plot_kinship_heatmap(G, labels):
 
 def plot_admixture(Q, labels, pop_labels, K):
     df = pd.DataFrame(Q, columns=[f"K{k+1}" for k in range(K)])
-    df["IID"] = labels; df["Pop"] = pop_labels
-    df["_dom"] = Q.argmax(axis=1)
+    df["IID"] = labels
+    df["Pop"] = pop_labels
+    dom = Q.argmax(axis=1)
+    df["_dom"] = dom
     df["_pop_order"] = pd.Categorical(pop_labels,
                                       categories=sorted(set(pop_labels)))
     df = df.sort_values(["_pop_order", "_dom"]).reset_index(drop=True)
     df["x"] = np.arange(len(df))
+
     palette = (px.colors.qualitative.Set2
                + px.colors.qualitative.Set3)[:K]
     fig = go.Figure()
@@ -1167,7 +1119,8 @@ def plot_admixture(Q, labels, pop_labels, K):
                       title=f"Proportions d'ancestralité (K={K})",
                       xaxis_title="Individus (triés)",
                       yaxis_title="Proportion",
-                      height=500, margin=dict(l=40, r=20, t=60, b=40))
+                      height=500,
+                      margin=dict(l=40, r=20, t=60, b=40))
     return fig, df
 
 
@@ -1192,7 +1145,8 @@ def plot_roh_histogram(froh, labels):
 
 
 def plot_roh_manhattan(roh_df, ind_labels, max_ind_display=50):
-    if roh_df.empty: return None
+    if roh_df.empty:
+        return None
     df = roh_df.copy()
     df["IID"] = [ind_labels[i] for i in df["IID_idx"]]
     if df["IID"].nunique() > max_ind_display:
@@ -1202,11 +1156,13 @@ def plot_roh_manhattan(roh_df, ind_labels, max_ind_display=50):
     df["_k0"] = order.map(lambda t: t[0])
     df["_k1"] = order.map(lambda t: t[1])
     df = df.sort_values(["_k0", "_k1", "start_bp"])
+
     fig = go.Figure()
     chr_offset, offset = {}, 0
     for chrom in df["CHR"].unique():
         chr_len = ARS_UCD12_LENGTHS.get(str(chrom).upper(), 100_000_000)
-        chr_offset[chrom] = offset; offset += chr_len
+        chr_offset[chrom] = offset
+        offset += chr_len
     iid_list = sorted(df["IID"].unique())
     y_map = {iid: i for i, iid in enumerate(iid_list)}
     for _, r in df.iterrows():
@@ -1234,7 +1190,8 @@ def build_report_html(config, stats, figures=None):
     figures = figures or {}
     first, blocks = True, []
     for title, fig in figures.items():
-        if fig is None: continue
+        if fig is None:
+            continue
         html = fig.to_html(full_html=False,
                            include_plotlyjs="cdn" if first else False)
         first = False
@@ -1260,7 +1217,7 @@ def build_report_html(config, stats, figures=None):
 </ul></div>
 {figs_html}
 <hr><p style="font-size:0.85em; color:#666">
-Rapport généré automatiquement par Bovine SNP Platform v3.3.</p>
+Rapport généré automatiquement par Bovine SNP Platform v3.2.1.</p>
 </body></html>
 """
 
@@ -1274,9 +1231,9 @@ _STATE_KEYS = [
     "gt_filt", "ind_filt", "snp_filt", "qc_stats",
     "pca_scores", "pca_var", "mds_coords", "kinship",
     "ld_df", "fst", "fst_pairwise_matrix", "fst_pops",
-    "admixture_Q", "admixture_K", "roh_df", "froh",
-    "run_requested", "ped_analysis", "ped_bytes_cache",
-    "map_bytes_cache",
+    "admixture_Q", "admixture_K",
+    "roh_df", "froh",
+    "run_requested",
 ]
 
 
@@ -1301,10 +1258,11 @@ def reset_all_derived():
         st.session_state[k] = None
 
 
-def has_data(): return st.session_state.gt is not None
+def has_data() -> bool:
+    return st.session_state.gt is not None
 
 
-def has_qc():
+def has_qc() -> bool:
     return (st.session_state.gt_filt is not None
             and st.session_state.qc_stats is not None
             and st.session_state.ind_filt is not None
@@ -1345,124 +1303,26 @@ def main():
                 st.success(f"✅ {gt.shape[0]} ind × {gt.shape[1]} SNPs")
 
         elif mode == "Upload PED/MAP":
-            st.info("💡 Formats : .ped, .ped.gz, .map, .map.gz")
-            ped_file = st.file_uploader("Fichier .ped",
+            st.info("💡 Formats acceptés : .ped standard, .ped.gz, "
+                    ".map, .map.gz")
+            ped_file = st.file_uploader("Fichier .ped (ou .ped.gz)",
                                         type=["ped", "gz", "txt"])
-            map_file = st.file_uploader("Fichier .map",
+            map_file = st.file_uploader("Fichier .map (ou .map.gz)",
                                         type=["map", "gz", "txt"])
-
-            # ========= MODE PARSING =========
-            st.divider()
-            st.subheader("🔧 Mode de parsing")
-
-            parsing_mode = st.radio(
-                "Mode", ["Auto (recommandé)", "Manuel"],
-                index=0, key="parsing_mode")
-
-            manual_params = None
-            if parsing_mode == "Manuel":
-                st.caption("Ajustez les paramètres si l'auto-détection échoue.")
-
-                sep_label = st.selectbox(
-                    "Séparateur",
-                    list(SEP_OPTIONS.keys()), index=0,
-                    key="manual_sep")
-                sep_value = SEP_OPTIONS[sep_label]
-
-                header_lines = st.number_input(
-                    "Lignes d'en-tête à ignorer",
-                    min_value=0, max_value=100, value=0, step=1,
-                    key="manual_header",
-                    help="Nombre de lignes à skipper avant les données")
-
-                metadata_cols = st.number_input(
-                    "Colonnes de métadonnées",
-                    min_value=0, max_value=20, value=6, step=1,
-                    key="manual_meta",
-                    help="FID, IID, PID, MID, SEX, PHENO = 6 (standard PED)")
-
-                use_manual_cols = st.checkbox(
-                    "Forcer le nombre total de colonnes",
-                    value=False, key="manual_use_cols")
-                expected_cols = "auto"
-                if use_manual_cols:
-                    expected_cols = st.number_input(
-                        "Colonnes totales attendues",
-                        min_value=1, max_value=10_000_000,
-                        value=100_000, step=100,
-                        key="manual_expected")
-
-                manual_params = {
-                    "separator": sep_value,
-                    "header_lines": int(header_lines),
-                    "metadata_cols": int(metadata_cols),
-                    "expected_cols": expected_cols,
-                }
-
-            # ========= ANALYSE =========
-            if ped_file is not None:
-                if st.button("🔍 Analyser le fichier PED",
-                             use_container_width=True):
-                    try:
-                        with st.spinner("Analyse en cours..."):
-                            ped_bytes = ped_file.read()
-                            analysis = analyze_ped_file(ped_bytes)
-                            st.session_state.ped_analysis = analysis
-                            st.session_state.ped_bytes_cache = ped_bytes
-                    except Exception as e:
-                        st.error(f"❌ {e}")
-
-                if st.session_state.ped_analysis:
-                    ana = st.session_state.ped_analysis
-                    if ana.get("error"):
-                        st.error(f"❌ {ana['error']}")
-                    else:
-                        with st.expander("📊 Diagnostic du fichier",
-                                         expanded=True):
-                            st.write(f"**Encodage** : {ana['encoding']}")
-                            st.write(f"**Séparateur détecté** : "
-                                     f"`{ana['separator_name']}`")
-                            st.write(f"**Lignes totales** : "
-                                     f"{ana['n_lines_total']:,}")
-                            st.write("**Aperçu des 10 premières lignes :**")
-                            preview_df = pd.DataFrame(ana["line_info"])
-                            preview_df.columns = ["Ligne", "Colonnes",
-                                                  "Aperçu (8 premiers champs)"]
-                            st.dataframe(preview_df, use_container_width=True)
-                            st.write("**Distribution des longueurs (100 "
-                                     "premières lignes) :**")
-                            dist_df = pd.DataFrame(
-                                ana["lengths_distribution"],
-                                columns=["Colonnes", "Nb lignes"])
-                            st.dataframe(dist_df, use_container_width=True)
-
-                            # Suggestion auto
-                            most_common = ana["lengths_distribution"][0][0] \
-                                if ana["lengths_distribution"] else 0
-                            st.info(
-                                f"💡 Le format le plus fréquent a "
-                                f"**{most_common}** colonnes par ligne. "
-                                f"Utilisez le **Mode Manuel** pour l'imposer.")
-
-            # ========= CHARGER =========
             if ped_file and map_file:
                 if st.button("📥 Charger PED + MAP",
-                             use_container_width=True, type="primary"):
+                             use_container_width=True):
                     try:
-                        with st.spinner("Parsing .map..."):
+                        with st.spinner("Parsing du .map..."):
                             map_df, rej_map = parse_map(map_file.read())
-                        st.info(f"📋 MAP : **{len(map_df)}** SNPs")
+                        st.info(f"📋 MAP chargé : **{len(map_df)}** SNPs")
 
-                        # Utiliser le cache si dispo
-                        if st.session_state.ped_bytes_cache:
-                            ped_bytes = st.session_state.ped_bytes_cache
-                        else:
-                            ped_bytes = ped_file.read()
-
-                        with st.spinner("Parsing PED..."):
+                        with st.spinner(
+                            f"Parsing du .ped "
+                            f"({ped_file.size / 1024 / 1024:.1f} Mo)..."
+                        ):
                             gt, ind_df, rej_ped = parse_ped(
-                                ped_bytes, len(map_df),
-                                manual_params=manual_params)
+                                ped_file.read(), len(map_df))
 
                         if len(map_df) != gt.shape[1]:
                             map_df = map_df.iloc[:gt.shape[1]].reset_index(
@@ -1472,15 +1332,14 @@ def main():
                         st.session_state.ind_df = ind_df
                         st.session_state.snp_df = map_df
                         reset_all_derived()
-                        st.session_state.ped_analysis = None
-                        st.session_state.ped_bytes_cache = None
 
                         st.success(
-                            f"✅ **{gt.shape[0]}** ind × "
+                            f"✅ **{gt.shape[0]}** individus × "
                             f"**{gt.shape[1]}** SNPs chargés")
                         if rej_map or rej_ped:
-                            st.warning(f"⚠️ Rejets : {rej_map} (map), "
-                                       f"{rej_ped} (ped)")
+                            st.warning(
+                                f"⚠️ Lignes rejetées : {rej_map} (map), "
+                                f"{rej_ped} (ped)")
                     except Exception as e:
                         st.error(f"❌ {e}")
 
@@ -1530,46 +1389,30 @@ def main():
                 st.session_state.run_requested = True
 
         st.divider()
-        st.caption("v3.3 — Parser adaptatif (Auto/Manuel) · PLINK/VCF · "
-                   "NMF · ROH · FST · Cache · ARS-UCD1.2")
+        st.caption("v3.2.1 — Parser PED universel · PLINK/VCF · NMF · ROH · "
+                   "FST pairwise · Cache · ARS-UCD1.2")
 
     # ---------- MAIN ----------
     if not has_data():
         st.info("👉 Générez un jeu de démo ou importez un `.ped`+`.map` "
                 "ou un `.vcf` depuis la barre latérale.")
+        st.markdown("""
+        ### Formats supportés
+        | Format | Extension | Notes |
+        |---|---|---|
+        | PLINK text | `.ped` + `.map` | Standard |
+        | PLINK gzippé | `.ped.gz` + `.map.gz` | Auto-détecté |
+        | VCF 4.2 | `.vcf`, `.vcf.gz` | Biallélique |
+        | PLINK binaire | `.bed` + `.bim` + `.fam` | ❌ Non supporté (utiliser `plink --recode`) |
 
-        with st.expander("💡 Comment charger un fichier PED qui ne marche pas ?",
-                         expanded=False):
-            st.markdown("""
-            ### Étapes de diagnostic
-
-            1. **Cliquez sur "🔍 Analyser le fichier PED"** dans la sidebar
-               → vous verrez les 10 premières lignes avec leur nombre de colonnes.
-
-            2. **Selon le résultat :**
-
-            | Symptôme | Solution |
-            |---|---|
-            | 1ère ligne a **~7 colonnes** | C'est un header → mettez **1** dans "Lignes d'en-tête" |
-            | Toutes les lignes ont **peu de colonnes** | Mauvais séparateur → essayez Tabulation / Virgule |
-            | 1ère ligne a **~98 000 colonnes** | ✅ Format OK → laissez en Auto |
-            | Lignes ont **des longueurs très variables** | Fichier tronqué → ré-uploadez |
-            | Le fichier commence par `##` | C'est un **VCF** → utilisez l'onglet VCF |
-
-            3. **Mode Manuel** dans la sidebar permet de forcer :
-               - Le **séparateur** (Tab, Espace, Virgule, `;`)
-               - Le nombre de **lignes d'en-tête** (0 à 100)
-               - Le nombre de **colonnes de métadonnées** (défaut 6)
-               - Le nombre **total de colonnes** attendues
-
-            ### Formats supportés
-            | Format | Extension |
-            |---|---|
-            | PLINK text | `.ped` + `.map` |
-            | PLINK gzippé | `.ped.gz` + `.map.gz` |
-            | VCF 4.2 | `.vcf`, `.vcf.gz` |
-            | PLINK binaire | ❌ (utiliser `plink --recode`) |
-            """)
+        ### Modules
+        - **QC** : missingness, MAF, HWE exact, hétérozygotie
+        - **Structure** : PCA, MDS (IBS), GRM
+        - **Admixture** : NMF (K composantes ajustables)
+        - **Démographie** : LD decay, ROH + FROH
+        - **Sélection** : FST/SNP, Manhattan, FST pairwise
+        - **Export** : PLINK `.bed/.bim/.fam`, VCF, ZIP
+        """)
         return
 
     gt = st.session_state.gt
@@ -1580,7 +1423,7 @@ def main():
                     "📈 Démographie", "🔍 Sélection", "📤 Export",
                     "📄 Rapport"])
 
-    # ---------- TAB 1 ----------
+    # ---------- TAB 1 : Aperçu ----------
     with tabs[0]:
         c1, c2, c3 = st.columns(3)
         c1.metric("Individus", gt.shape[0])
@@ -1590,14 +1433,17 @@ def main():
         st.dataframe(ind_df.head(20), use_container_width=True)
         st.subheader("SNPs")
         st.dataframe(snp_df.head(5), use_container_width=True)
+
         with st.expander("🔬 Compatibilité ARS-UCD1.2"):
             chroms_seen = sorted(snp_df["CHR"].astype(str).unique(),
                                  key=_chr_sort_key)
             bovines = [c for c in chroms_seen
-                       if c.upper().replace("CHR", "") in ARS_UCD12_LENGTHS]
-            st.write(f"Chromosomes : {len(chroms_seen)}")
-            st.write(f"Compatibles ARS-UCD1.2 : "
-                     f"{'✅ oui' if len(bovines) == len(chroms_seen) else '⚠️ partiel'}")
+                       if c.upper().replace("CHR", "")
+                       in ARS_UCD12_LENGTHS]
+            st.write(f"Chromosomes détectés : {len(chroms_seen)}")
+            st.write(
+                f"Compatibles ARS-UCD1.2 : "
+                f"{'✅ oui' if len(bovines) == len(chroms_seen) else '⚠️ partiel'}")
             cov = []
             for c in chroms_seen:
                 key = str(c).upper().replace("CHR", "")
@@ -1678,6 +1524,7 @@ def main():
                     st.success("✅ Terminé.")
                 except Exception as e:
                     st.error(f"❌ {e}")
+
             labels = st.session_state.ind_filt["FID"].values
             if st.session_state.pca_scores is not None:
                 st.plotly_chart(plot_pca(st.session_state.pca_scores,
@@ -1716,6 +1563,7 @@ def main():
                     st.success(f"✅ Q : {Q.shape}")
                 except Exception as e:
                     st.error(f"❌ {e}")
+
             if st.session_state.admixture_Q is not None:
                 Q = st.session_state.admixture_Q
                 K = st.session_state.admixture_K
@@ -1735,6 +1583,7 @@ def main():
             st.warning("⚠️ Lancez d'abord le QC.")
         else:
             sub1, sub2 = st.tabs(["LD decay", "ROH"])
+
             with sub1:
                 c1, c2 = st.columns(2)
                 max_kb = c1.slider("Distance max (kb)", 100, 5000, 1000, 100)
@@ -1757,6 +1606,7 @@ def main():
                     fig = plot_ld_decay(st.session_state.ld_df)
                     if fig:
                         st.plotly_chart(fig, use_container_width=True)
+
             with sub2:
                 c1, c2 = st.columns(2)
                 min_snps = c1.slider("Min SNPs par ROH", 5, 200, 30, 5)
@@ -1776,6 +1626,7 @@ def main():
                         st.success(f"✅ {len(roh_df)} ROH détectés")
                     except Exception as e:
                         st.error(f"❌ {e}")
+
                 if st.session_state.froh is not None:
                     froh = st.session_state.froh
                     roh_df = st.session_state.roh_df
@@ -1796,8 +1647,9 @@ def main():
                         st.subheader("Top 10 les plus consanguins")
                         st.dataframe(top_df.round(4),
                                      use_container_width=True)
-                        st.plotly_chart(plot_roh_manhattan(roh_df, iids),
-                                        use_container_width=True)
+                        st.plotly_chart(
+                            plot_roh_manhattan(roh_df, iids),
+                            use_container_width=True)
 
     # ---------- TAB 6 : Sélection ----------
     with tabs[5]:
@@ -1806,6 +1658,7 @@ def main():
             st.warning("⚠️ Lancez d'abord le QC.")
         else:
             sub1, sub2 = st.tabs(["FST/SNP + Manhattan", "FST pairwise"])
+
             with sub1:
                 threshold_q = st.slider("Quantile outliers",
                                         0.95, 0.9999, 0.999, 0.0001,
@@ -1820,6 +1673,7 @@ def main():
                         st.success("✅ FST calculé.")
                     except Exception as e:
                         st.error(f"❌ {e}")
+
                 if st.session_state.fst is not None:
                     fst_clean = st.session_state.fst[
                         np.isfinite(st.session_state.fst)]
@@ -1828,14 +1682,16 @@ def main():
                         c1.metric("FST moyen", f"{fst_clean.mean():.4f}")
                         c2.metric("FST médian",
                                   f"{np.median(fst_clean):.4f}")
-                        c3.metric("Top outliers",
-                                  f"{np.quantile(fst_clean, threshold_q):.4f}")
+                        c3.metric(
+                            "Top outliers",
+                            f"{np.quantile(fst_clean, threshold_q):.4f}")
                         fig = plot_manhattan(
                             st.session_state.fst,
                             st.session_state.snp_filt["CHR"].values,
                             threshold_q=threshold_q)
                         if fig:
                             st.plotly_chart(fig, use_container_width=True)
+
             with sub2:
                 if st.button("▶ Calculer FST pairwise", key="btn_fstp",
                              use_container_width=True):
@@ -1849,6 +1705,7 @@ def main():
                         st.success("✅ Matrice calculée.")
                     except Exception as e:
                         st.error(f"❌ {e}")
+
                 if st.session_state.fst_pairwise_matrix is not None:
                     st.plotly_chart(
                         plot_fst_pairwise(
@@ -1864,6 +1721,7 @@ def main():
         else:
             prefix = st.text_input("Préfixe des fichiers", "bovine_qc")
             c1, c2, c3 = st.columns(3)
+
             with c1:
                 if st.button("📦 Préparer PLINK ZIP",
                              use_container_width=True):
@@ -1885,6 +1743,7 @@ def main():
                         file_name=f"{prefix}_plink.zip",
                         mime="application/zip",
                         use_container_width=True)
+
             with c2:
                 if st.button("📄 Préparer VCF",
                              use_container_width=True):
@@ -1906,6 +1765,7 @@ def main():
                         file_name=f"{prefix}.vcf",
                         mime="text/plain",
                         use_container_width=True)
+
             with c3:
                 st.metric("Individus exportés",
                           st.session_state.gt_filt.shape[0])
@@ -1918,7 +1778,8 @@ def main():
         if not has_qc():
             st.warning("⚠️ Lancez au moins le QC.")
         else:
-            project_name = st.text_input("Nom du projet", "Cattle_Project")
+            project_name = st.text_input("Nom du projet",
+                                         "Cattle_Project")
             if st.button("📄 Générer le rapport",
                          use_container_width=True):
                 figures = {}
@@ -1950,6 +1811,7 @@ def main():
                     figures["FROH"] = plot_roh_histogram(
                         st.session_state.froh,
                         st.session_state.ind_filt["FID"].values)
+
                 html = build_report_html(
                     config={"project_name": project_name},
                     stats=st.session_state.qc_stats,
@@ -1963,13 +1825,14 @@ def main():
                     use_container_width=True)
                 st.success("✅ Rapport prêt.")
                 with st.expander("Prévisualisation"):
-                    st.components.v1.html(html, height=700, scrolling=True)
+                    st.components.v1.html(html, height=700,
+                                          scrolling=True)
 
     # ---------- PIPELINE COMPLET ----------
     if st.session_state.get("run_requested"):
         st.session_state.run_requested = False
         try:
-            with st.spinner("Pipeline complet..."):
+            with st.spinner("Pipeline complet en cours..."):
                 params = {"geno": geno, "mind": mind, "maf": maf_thr,
                           "hwe": hwe_thr, "het_sd": het_sd}
                 gt_f, ind_f, snp_f, qc_stats = apply_qc_filters(
@@ -1980,6 +1843,7 @@ def main():
                 st.session_state.snp_filt = snp_f
                 st.session_state.qc_stats = qc_stats
                 invalidate_downstream()
+
                 st.session_state.pca_scores, st.session_state.pca_var = \
                     pca_analysis(gt_f, 10)
                 st.session_state.mds_coords = mds_analysis(gt_f, 5)
