@@ -2,11 +2,12 @@
 🐄 Bovine SNP Platform
 Pipeline complet de bioinformatique pour puces SNP bovines.
 
-Version 3.1 — corrections :
-  - Décorateur cache_data flexible (@cache_data et @cache_data(...))
-  - Hachage ndarray robuste (shape, dtype, sommes)
-  - Reset complet de l'état entre datasets
-  - Modules : PLINK/VCF · NMF · ROH · FST pairwise · Cache · ARS-UCD1.2
+Version 3.2 — Parser PED universel :
+  - Détection automatique du format (texte / gzip / binaire PLINK)
+  - Auto-ajustement du nombre de SNPs (PED ≠ MAP)
+  - Détection du format transposé (--tfile)
+  - Messages d'erreur détaillés avec le nombre de colonnes réel
+  - Rapport ligne par ligne des problèmes rencontrés
 """
 
 import gzip
@@ -60,11 +61,10 @@ BOVINE_AUTOSOMES = [str(i) for i in range(1, 30)]
 
 
 # ============================================================
-# [MODULE 5] CACHE STREAMLIT — CORRIGÉ
+# [MODULE 5] CACHE STREAMLIT
 # ============================================================
 
 def _hash_ndarray(x: np.ndarray):
-    """Hash stable pour np.ndarray (évite de sérialiser tout le buffer)."""
     if not isinstance(x, np.ndarray) or x.size == 0:
         return ("empty",)
     return (
@@ -80,28 +80,20 @@ HASH_FUNCS = {np.ndarray: _hash_ndarray}
 
 
 def cache_data(func=None, **kw):
-    """
-    Décorateur flexible compatible avec :
-        @cache_data
-        @cache_data(ttl=3600)
-    """
+    """Décorateur flexible : @cache_data ou @cache_data(ttl=3600)."""
     def _decorate(f):
         return st.cache_data(
-            show_spinner=False,
-            hash_funcs=HASH_FUNCS,
-            **kw,
-        )(f)
+            show_spinner=False, hash_funcs=HASH_FUNCS, **kw)(f)
     if func is None:
         return _decorate
     return _decorate(func)
 
 
 # ============================================================
-# UTILITAIRES NUMÉRIQUES
+# UTILITAIRES
 # ============================================================
 
 def impute_mean(gt: np.ndarray) -> np.ndarray:
-    """Imputation par moyenne de colonne (par SNP). Retourne une copie."""
     gt2 = gt.astype(np.float32, copy=True)
     col_mean = np.nanmean(gt2, axis=0)
     col_mean = np.where(np.isnan(col_mean), 0.0, col_mean)
@@ -128,12 +120,35 @@ def _chr_sort_key(chrom):
     return (2, 0, s)
 
 
+def _detect_encoding(raw: bytes) -> str:
+    """Détecte si un fichier est gzip, binaire PLINK ou texte."""
+    if len(raw) >= 2 and raw[:2] == b"\x1f\x8b":
+        return "gzip"
+    if len(raw) >= 2 and raw[:2] == b"\x6c\x1b":
+        return "plink_binary"
+    return "text"
+
+
 # ============================================================
-# PARSING PED / MAP
+# PARSING MAP
 # ============================================================
 
 def parse_map(map_bytes: bytes) -> tuple:
-    text = map_bytes.decode("utf-8", errors="replace")
+    """Parse un fichier .map (chr, snp_id, cm, bp). Gère gzip."""
+    enc = _detect_encoding(map_bytes)
+    if enc == "gzip":
+        try:
+            text = gzip.decompress(map_bytes).decode("utf-8", errors="replace")
+        except Exception as e:
+            raise ValueError(f"Fichier .map.gz corrompu : {e}")
+    elif enc == "plink_binary":
+        raise ValueError(
+            "❌ Le fichier .map est en binaire PLINK (magic bytes 6C 1B).\n"
+            "👉 Un .map doit être du texte. Le fichier uploadé est "
+            "probablement un .bed renommé.")
+    else:
+        text = map_bytes.decode("utf-8", errors="replace")
+
     rows, rejected = [], 0
     for line in text.splitlines():
         line = line.strip()
@@ -152,39 +167,158 @@ def parse_map(map_bytes: bytes) -> tuple:
         except (ValueError, TypeError):
             rejected += 1
             continue
-        rows.append({"CHR": str(parts[0]), "SNP": parts[1], "CM": cm, "BP": bp})
+        rows.append({"CHR": str(parts[0]), "SNP": parts[1],
+                     "CM": cm, "BP": bp})
+
     if not rows:
         raise ValueError("Fichier .map vide ou invalide.")
     return pd.DataFrame(rows), rejected
 
 
-def parse_ped(ped_bytes: bytes, n_snp: int) -> tuple:
-    """Parse .ped et encode en dosage 0/1/2 de l'allèle mineur (2 passes)."""
-    text = ped_bytes.decode("utf-8", errors="replace")
-    fids, iids, geno_rows = [], [], []
-    rejected, expected_cols = 0, 6 + 2 * n_snp
+# ============================================================
+# PARSING PED — VERSION UNIVERSELLE
+# ============================================================
 
-    for line in text.splitlines():
-        line = line.strip()
-        if not line:
-            continue
+def _diagnose_ped_first_line(line: str, n_snp_map: int) -> dict:
+    """Analyse la 1ère ligne pour diagnostiquer le format."""
+    parts = line.split()
+    n_cols = len(parts)
+    return {
+        "n_cols": n_cols,
+        "first_cols": parts[:10],
+        "expected_cols": 6 + 2 * n_snp_map,
+        "n_snp_inferred": max(0, (n_cols - 6) // 2),
+        "looks_like_ped": n_cols >= 7 and parts[2] in ("0", "1", "2", "3",
+                                                       "-9", "."),
+    }
+
+
+def parse_ped(ped_bytes: bytes, n_snp_map: int) -> tuple:
+    """
+    Parser PED universel et robuste.
+
+    Gère :
+      - PED standard (texte, 6 + 2*N colonnes)
+      - Fichier gzippé (.ped.gz)
+      - Binaire PLINK renommé en .ped (erreur claire)
+      - Désalignement PED / MAP (auto-ajustement)
+      - Format transposé (1 SNP par ligne → erreur explicite)
+      - Fichier tronqué (rapport des lignes rejetées)
+
+    Retourne : (gt, ind_df, n_rejected)
+    """
+    # --- 1. Détection encodage ---
+    enc = _detect_encoding(ped_bytes)
+    if enc == "gzip":
+        try:
+            text = gzip.decompress(ped_bytes).decode("utf-8", errors="replace")
+        except Exception as e:
+            raise ValueError(f"Fichier .ped.gz corrompu : {e}")
+    elif enc == "plink_binary":
+        raise ValueError(
+            "❌ Ce fichier est un PLINK binaire (.bed) renommé en .ped.\n"
+            "👉 Conversions possibles :\n"
+            "   • PLINK :  plink --bfile PREFIX --recode --out PREFIX\n"
+            "   • Python : utilisez le parser .bed natif (module séparé)\n"
+            "   • Ou renommez-le en .bed et utilisez un autre outil.")
+    else:
+        text = ped_bytes.decode("utf-8", errors="replace")
+
+    # --- 2. Lecture brute des lignes ---
+    lines = [l.strip() for l in text.splitlines() if l.strip()]
+    if not lines:
+        raise ValueError("Fichier .ped vide.")
+
+    # --- 3. Diagnostic 1ère ligne ---
+    diag = _diagnose_ped_first_line(lines[0], n_snp_map)
+    n_cols_first = diag["n_cols"]
+    n_snp_ped = diag["n_snp_inferred"]
+    expected_cols = diag["expected_cols"]
+
+    # Cas particulier : format transposé (peu de colonnes, détection de tfile)
+    if n_cols_first < 7:
+        raise ValueError(
+            f"❌ Format PED invalide.\n"
+            f"   La 1ère ligne contient seulement {n_cols_first} colonnes.\n"
+            f"   Un PED standard doit avoir au minimum 7 colonnes "
+            f"(FID, IID, PID, MID, SEX, PHENO + génotypes).\n"
+            f"   → Vérifiez le séparateur (espaces/tabulations) ou le format.")
+
+    # Cas particulier : fichier transposé (ex: 1 SNP par ligne, format --tfile)
+    if n_snp_ped > 0 and n_snp_ped < 10 and len(lines) > 100:
+        raise ValueError(
+            f"⚠️ Fichier probablement au format TRANSPOSÉ (--tfile).\n"
+            f"   {len(lines)} lignes × {n_cols_first} colonnes "
+            f"→ 1 SNP par ligne au lieu de 1 individu par ligne.\n"
+            f"   👉 Convertissez avec : "
+            f"plink --tfile PREFIX --recode --out PREFIX")
+
+    # --- 4. Auto-ajustement du nombre de SNPs ---
+    if n_snp_ped != n_snp_map and n_snp_ped > 0:
+        st.warning(
+            f"⚠️ Désalignement PED / MAP détecté\n"
+            f"   • MAP : **{n_snp_map}** SNPs\n"
+            f"   • PED : **{n_snp_ped}** SNPs (déduit de la 1ère ligne)\n"
+            f"   → Utilisation de **{min(n_snp_map, n_snp_ped)}** SNPs communs.")
+        n_snp_eff = min(n_snp_map, n_snp_ped)
+    else:
+        n_snp_eff = n_snp_map
+
+    expected_cols_eff = 6 + 2 * n_snp_eff
+
+    # --- 5. Filtrage des lignes valides ---
+    fids, iids, geno_rows = [], [], []
+    rejected_short = 0
+    rejected_empty = 0
+    lengths_seen = Counter()
+
+    for line in lines:
         parts = line.split()
-        if len(parts) < expected_cols:
-            rejected += 1
+        lengths_seen[len(parts)] += 1
+        if len(parts) < 7:
+            rejected_empty += 1
+            continue
+        if len(parts) < expected_cols_eff:
+            rejected_short += 1
             continue
         fids.append(parts[0])
         iids.append(parts[1])
-        geno_rows.append(parts[6:6 + 2 * n_snp])
+        geno_rows.append(parts[6:6 + 2 * n_snp_eff])
 
     n_ind = len(iids)
-    if n_ind == 0:
-        raise ValueError(
-            f"Aucun individu valide (colonnes requises : {expected_cols}).")
 
-    # Passe 1 : comptage
-    allele_counts = [Counter() for _ in range(n_snp)]
+    # --- 6. Rapport d'erreur détaillé si échec complet ---
+    if n_ind == 0:
+        # Trouver la longueur de ligne la plus fréquente
+        top_lengths = lengths_seen.most_common(3)
+        top_str = ", ".join([f"{length} cols × {count} lignes"
+                             for length, count in top_lengths])
+        raise ValueError(
+            f"❌ Aucun individu chargé.\n\n"
+            f"**Diagnostic automatique :**\n"
+            f   "• Nombre de SNPs dans le MAP : **{n_snp_map}**\n"
+            f"• Colonnes attendues par ligne : **{expected_cols_eff}**\n"
+            f"• 1ère ligne PED : **{n_cols_first}** colonnes\n"
+            f"• Longueurs les plus fréquentes : {top_str}\n"
+            f"• Lignes trop courtes : {rejected_short}\n"
+            f"• Lignes quasi-vides : {rejected_empty}\n\n"
+            f"**Causes probables :**\n"
+            f"1. Le fichier est **tronqué** (upload interrompu)\n"
+            f"2. Le **PED et le MAP ne correspondent pas**\n"
+            f"3. Le séparateur n'est pas un espace (mais tabulation "
+            f"incohérente ou autre)\n"
+            f"4. Le fichier n'est pas en format PLINK PED (ex: VCF, "
+            f"CSV, .raw)")
+
+    if rejected_short > 0:
+        st.warning(
+            f"⚠️ {rejected_short} ligne(s) ignorée(s) — colonnes "
+            f"manquantes (< {expected_cols_eff}).")
+
+    # --- 7. Passe 1 : comptage des allèles ---
+    allele_counts = [Counter() for _ in range(n_snp_eff)]
     for row in geno_rows:
-        for j in range(n_snp):
+        for j in range(n_snp_eff):
             a1, a2 = row[2 * j], row[2 * j + 1]
             if a1 == "0" or a2 == "0":
                 continue
@@ -192,16 +326,16 @@ def parse_ped(ped_bytes: bytes, n_snp: int) -> tuple:
             c[a1] += 1
             c[a2] += 1
 
-    minor = [None] * n_snp
+    minor = [None] * n_snp_eff
     for j, c in enumerate(allele_counts):
         if len(c) < 2:
             continue
         minor[j] = min(c, key=c.get)
 
-    # Passe 2 : dosage 0/1/2
-    gt = np.full((n_ind, n_snp), np.nan, dtype=np.float32)
+    # --- 8. Passe 2 : dosage 0/1/2 de l'allèle mineur ---
+    gt = np.full((n_ind, n_snp_eff), np.nan, dtype=np.float32)
     for i, row in enumerate(geno_rows):
-        for j in range(n_snp):
+        for j in range(n_snp_eff):
             m = minor[j]
             if m is None:
                 continue
@@ -211,18 +345,29 @@ def parse_ped(ped_bytes: bytes, n_snp: int) -> tuple:
             gt[i, j] = (1 if a1 == m else 0) + (1 if a2 == m else 0)
 
     ind_df = pd.DataFrame({"FID": fids, "IID": iids})
-    return gt, ind_df, rejected
+
+    # --- 9. Alignement avec le MAP (troncature si désaligné) ---
+    if n_snp_eff < n_snp_map:
+        st.info(
+            f"ℹ️ Le MAP contenait {n_snp_map} SNPs, mais seulement "
+            f"{n_snp_eff} ont été chargés. Les SNPs excédentaires seront "
+            f"ignorés automatiquement.")
+
+    return gt, ind_df, rejected_short + rejected_empty
 
 
 # ============================================================
-# [MODULE 6] PARSING VCF / VCF.GZ
+# [MODULE 6] PARSING VCF
 # ============================================================
 
 def parse_vcf(vcf_bytes: bytes) -> tuple:
-    """Parse un VCF (gzip auto-détecté) — variants bialléliques uniquement."""
-    is_gz = len(vcf_bytes) >= 2 and vcf_bytes[0] == 0x1F and vcf_bytes[1] == 0x8B
+    """Parse VCF (gzip auto-détecté), variants bialléliques."""
+    is_gz = len(vcf_bytes) >= 2 and vcf_bytes[:2] == b"\x1f\x8b"
     if is_gz:
-        text = gzip.decompress(vcf_bytes).decode("utf-8", errors="replace")
+        try:
+            text = gzip.decompress(vcf_bytes).decode("utf-8", errors="replace")
+        except Exception as e:
+            raise ValueError(f"Fichier .vcf.gz corrompu : {e}")
     else:
         text = vcf_bytes.decode("utf-8", errors="replace")
 
@@ -246,7 +391,8 @@ def parse_vcf(vcf_bytes: bytes) -> tuple:
             n_skipped += 1
             continue
 
-        chrom, pos_s, vid, ref, alt = parts[0], parts[1], parts[2], parts[3], parts[4]
+        chrom, pos_s, vid, ref, alt = (parts[0], parts[1], parts[2],
+                                       parts[3], parts[4])
         if "," in alt:
             n_multi += 1
             continue
@@ -277,10 +423,8 @@ def parse_vcf(vcf_bytes: bytes) -> tuple:
             except ValueError:
                 continue
 
-        rows.append({
-            "CHR": str(chrom), "SNP": vid or f"{chrom}:{pos}",
-            "CM": 0.0, "BP": pos, "A1": ref, "A2": alt, "GT": gts,
-        })
+        rows.append({"CHR": str(chrom), "SNP": vid or f"{chrom}:{pos}",
+                     "CM": 0.0, "BP": pos, "A1": ref, "A2": alt, "GT": gts})
 
     if not rows:
         raise ValueError("Aucun variant biallélique trouvé dans le VCF.")
@@ -290,7 +434,7 @@ def parse_vcf(vcf_bytes: bytes) -> tuple:
     for j, r in enumerate(rows):
         gt[:, j] = r["GT"]
 
-    # Flip : dosage 2 = homozygote de l'allèle mineur
+    # Flip : dosage 2 = homozygote allèle mineur
     for j in range(n_snp):
         col = gt[:, j]
         valid = col[~np.isnan(col)]
@@ -369,6 +513,8 @@ def generate_demo_data(n_ind: int = 150, n_snp: int = 800,
 def missingness_per_ind(gt): return np.isnan(gt).mean(axis=1)
 def missingness_per_snp(gt): return np.isnan(gt).mean(axis=0)
 def allele_freq(gt): return np.nanmean(gt, axis=0) / 2.0
+
+
 def maf(gt):
     p = allele_freq(gt)
     return np.minimum(p, 1.0 - p)
@@ -533,7 +679,6 @@ def fst_per_snp(gt: np.ndarray, pop_labels: np.ndarray) -> np.ndarray:
 
 @cache_data
 def fst_pairwise(gt: np.ndarray, pop_labels: np.ndarray) -> tuple:
-    """FST de Nei pairwise entre toutes les paires de populations."""
     pops = sorted(np.unique(pop_labels))
     K = len(pops)
     matrix = np.full((K, K), np.nan)
@@ -619,13 +764,12 @@ def kinship_matrix(gt: np.ndarray) -> np.ndarray:
 
 
 # ============================================================
-# [MODULE 2] ADMIXTURE-LIKE (NMF)
+# [MODULE 2] ADMIXTURE NMF
 # ============================================================
 
 @cache_data
 def admixture_nmf(gt: np.ndarray, K: int = 3, seed: int = 42,
                   max_iter: int = 500) -> tuple:
-    """Estime les proportions d'ancestralité via NMF (Q : n_ind × K)."""
     X = np.clip(impute_mean(gt), 0.0, 2.0)
     model = NMF(n_components=K, init="nndsvda", random_state=seed,
                 max_iter=max_iter)
@@ -636,13 +780,12 @@ def admixture_nmf(gt: np.ndarray, K: int = 3, seed: int = 42,
 
 
 # ============================================================
-# [MODULE 3] ROH — Runs of Homozygosity
+# [MODULE 3] ROH
 # ============================================================
 
 @cache_data
 def detect_roh(gt: np.ndarray, snp_df_json: str,
                min_snps: int = 30, min_kb: float = 500.0) -> tuple:
-    """Détection de ROH par individu et par chromosome."""
     snp_df = pd.read_json(snp_df_json)
     chr_arr = snp_df["CHR"].astype(str).values
     bp = snp_df["BP"].astype(np.int64).values
@@ -815,8 +958,9 @@ def build_plink_zip(gt, ind_df, snp_df, prefix="bovine_qc") -> bytes:
 def plot_hist(values, title, xlabel, color="#3498db"):
     fig = go.Figure()
     fig.add_trace(go.Histogram(x=values, nbinsx=80, marker_color=color))
-    fig.update_layout(title=title, xaxis_title=xlabel, yaxis_title="Fréquence",
-                      height=380, margin=dict(l=40, r=20, t=50, b=40))
+    fig.update_layout(title=title, xaxis_title=xlabel,
+                      yaxis_title="Fréquence", height=380,
+                      margin=dict(l=40, r=20, t=50, b=40))
     return fig
 
 
@@ -824,10 +968,10 @@ def plot_missingness_dashboard(miss_ind, miss_snp):
     fig = make_subplots(rows=1, cols=2,
                         subplot_titles=("Missingness / individu",
                                         "Missingness / SNP"))
-    fig.add_trace(go.Histogram(x=miss_ind, nbinsx=60, marker_color="skyblue"),
-                  row=1, col=1)
-    fig.add_trace(go.Histogram(x=miss_snp, nbinsx=60, marker_color="coral"),
-                  row=1, col=2)
+    fig.add_trace(go.Histogram(x=miss_ind, nbinsx=60,
+                               marker_color="skyblue"), row=1, col=1)
+    fig.add_trace(go.Histogram(x=miss_snp, nbinsx=60,
+                               marker_color="coral"), row=1, col=2)
     fig.update_layout(height=400, showlegend=False,
                       margin=dict(l=40, r=20, t=60, b=40))
     fig.update_xaxes(title_text="Fréquence manquante", row=1, col=1)
@@ -842,8 +986,7 @@ def plot_pca(scores, var_pct, labels):
     fig = px.scatter(
         df, x="PC1", y="PC2", color="Population",
         title=(f"PCA — PC1 ({var_pct[0]:.1f}%) vs "
-               f"PC2 ({var_pct[1]:.1f}%)"),
-        height=550)
+               f"PC2 ({var_pct[1]:.1f}%)"), height=550)
     fig.update_traces(marker=dict(size=10, line=dict(width=1, color="white")))
     fig.update_layout(margin=dict(l=40, r=20, t=60, b=40))
     return fig
@@ -946,7 +1089,6 @@ def plot_kinship_heatmap(G, labels):
 
 
 def plot_admixture(Q, labels, pop_labels, K):
-    n = Q.shape[0]
     df = pd.DataFrame(Q, columns=[f"K{k+1}" for k in range(K)])
     df["IID"] = labels
     df["Pop"] = pop_labels
@@ -1069,7 +1211,7 @@ def build_report_html(config, stats, figures=None):
 </ul></div>
 {figs_html}
 <hr><p style="font-size:0.85em; color:#666">
-Rapport généré automatiquement par Bovine SNP Platform v3.1.</p>
+Rapport généré automatiquement par Bovine SNP Platform v3.2.</p>
 </body></html>
 """
 
@@ -1130,8 +1272,7 @@ def main():
 
     st.title("🐄 Bovine SNP Platform")
     st.caption("Pipeline complet pour puces SNP bovines — "
-               "QC · Structure · Admixture · ROH · FST · Export PLINK/VCF · "
-               "Référence ARS-UCD1.2.")
+               "QC · Structure · Admixture · ROH · FST · Export PLINK/VCF.")
 
     # ---------- SIDEBAR ----------
     with st.sidebar:
@@ -1156,27 +1297,43 @@ def main():
                 st.success(f"✅ {gt.shape[0]} ind × {gt.shape[1]} SNPs")
 
         elif mode == "Upload PED/MAP":
-            ped_file = st.file_uploader("Fichier .ped",
-                                        type=["ped", "txt"])
-            map_file = st.file_uploader("Fichier .map",
-                                        type=["map", "txt"])
+            st.info("💡 Formats acceptés : .ped standard, .ped.gz, "
+                    ".map, .map.gz")
+            ped_file = st.file_uploader("Fichier .ped (ou .ped.gz)",
+                                        type=["ped", "gz", "txt"])
+            map_file = st.file_uploader("Fichier .map (ou .map.gz)",
+                                        type=["map", "gz", "txt"])
             if ped_file and map_file:
-                if st.button("📥 Charger", use_container_width=True):
+                if st.button("📥 Charger PED + MAP",
+                             use_container_width=True):
                     try:
-                        with st.spinner("Parsing .map..."):
+                        with st.spinner("Parsing du .map..."):
                             map_df, rej_map = parse_map(map_file.read())
-                        with st.spinner("Parsing .ped (2 passes)..."):
+                        st.info(f"📋 MAP chargé : **{len(map_df)}** SNPs")
+
+                        with st.spinner(
+                            f"Parsing du .ped ({ped_file.size/1024/1024:.1f} Mo)..."
+                        ):
                             gt, ind_df, rej_ped = parse_ped(
                                 ped_file.read(), len(map_df))
+
+                        # Tronquer le MAP si désaligné
+                        if len(map_df) != gt.shape[1]:
+                            map_df = map_df.iloc[:gt.shape[1]].reset_index(
+                                drop=True)
+
                         st.session_state.gt = gt
                         st.session_state.ind_df = ind_df
                         st.session_state.snp_df = map_df
                         reset_all_derived()
-                        msg = f"✅ {gt.shape[0]} ind × {gt.shape[1]} SNPs"
+
+                        st.success(
+                            f"✅ **{gt.shape[0]}** individus × "
+                            f"**{gt.shape[1]}** SNPs chargés")
                         if rej_map or rej_ped:
-                            msg += (f" — ⚠️ rejets: {rej_map} (map), "
-                                    f"{rej_ped} (ped)")
-                        st.success(msg)
+                            st.warning(
+                                f"⚠️ Lignes rejetées : {rej_map} (map), "
+                                f"{rej_ped} (ped)")
                     except Exception as e:
                         st.error(f"❌ {e}")
 
@@ -1226,22 +1383,29 @@ def main():
                 st.session_state.run_requested = True
 
         st.divider()
-        st.caption("v3.1 — PLINK/VCF · NMF · ROH · FST pairwise · "
-                   "Cache · ARS-UCD1.2")
+        st.caption("v3.2 — Parser PED universel · PLINK/VCF · NMF · ROH · "
+                   "FST pairwise · Cache · ARS-UCD1.2")
 
     # ---------- MAIN ----------
     if not has_data():
         st.info("👉 Générez un jeu de démo ou importez un `.ped`+`.map` "
                 "ou un `.vcf` depuis la barre latérale.")
         st.markdown("""
-        ### Modules disponibles
+        ### Formats supportés
+        | Format | Extension | Notes |
+        |---|---|---|
+        | PLINK text | `.ped` + `.map` | Standard |
+        | PLINK gzippé | `.ped.gz` + `.map.gz` | Auto-détecté |
+        | VCF 4.2 | `.vcf`, `.vcf.gz` | Biallélique |
+        | PLINK binaire | `.bed` + `.bim` + `.fam` | ❌ Non supporté (utiliser `plink --recode`) |
+
+        ### Modules
         - **QC** : missingness, MAF, HWE exact, hétérozygotie
         - **Structure** : PCA, MDS (IBS), GRM
         - **Admixture** : NMF (K composantes ajustables)
         - **Démographie** : LD decay, ROH + FROH
         - **Sélection** : FST/SNP, Manhattan, FST pairwise
         - **Export** : PLINK `.bed/.bim/.fam`, VCF, ZIP
-        - **Référence** : ARS-UCD1.2
         """)
         return
 
@@ -1253,7 +1417,7 @@ def main():
                     "📈 Démographie", "🔍 Sélection", "📤 Export",
                     "📄 Rapport"])
 
-    # ---------- TAB 1 : Aperçu ----------
+    # ---------- TAB 1 ----------
     with tabs[0]:
         c1, c2, c3 = st.columns(3)
         c1.metric("Individus", gt.shape[0])
@@ -1281,12 +1445,12 @@ def main():
                     mask = snp_df["CHR"].astype(str) == c
                     max_bp = snp_df.loc[mask, "BP"].max()
                     cov.append({"CHR": c, "max_bp": int(max_bp),
-                                "ARS_UCD12_len": ARS_UCD12_LENGTHS[key],
+                                "ARS_len": ARS_UCD12_LENGTHS[key],
                                 "ok": max_bp <= ARS_UCD12_LENGTHS[key]})
             if cov:
                 st.dataframe(pd.DataFrame(cov), use_container_width=True)
 
-    # ---------- TAB 2 : QC ----------
+    # ---------- TAB 2 ----------
     with tabs[1]:
         st.subheader("Contrôle qualité")
         if st.button("▶ Lancer le QC", use_container_width=True):
@@ -1330,17 +1494,10 @@ def main():
                                           "Hétérozygotie observée",
                                           "HET", "#9b59b6"),
                                 use_container_width=True)
-            with st.expander("p-values HWE (post-filtrage)"):
-                pv = hwe_pvalues(st.session_state.gt_filt)
-                pv_ok = pv[np.isfinite(pv)]
-                if len(pv_ok) > 0:
-                    st.plotly_chart(plot_hist(pv_ok, "p-values HWE",
-                                              "p-value", "salmon"),
-                                    use_container_width=True)
         else:
             st.info("Cliquez sur **Lancer le QC**.")
 
-    # ---------- TAB 3 : Structure ----------
+    # ---------- TAB 3 ----------
     with tabs[2]:
         st.subheader("Structure des populations")
         if not has_qc():
@@ -1379,7 +1536,7 @@ def main():
                     st.session_state.kinship, id_labels),
                     use_container_width=True)
 
-    # ---------- TAB 4 : Admixture ----------
+    # ---------- TAB 4 ----------
     with tabs[3]:
         st.subheader("Proportions d'ancestralité (NMF)")
         if not has_qc():
@@ -1413,7 +1570,7 @@ def main():
                     [f"K{k+1}" for k in range(K)]].mean()
                 st.dataframe(tmp.round(3), use_container_width=True)
 
-    # ---------- TAB 5 : Démographie ----------
+    # ---------- TAB 5 ----------
     with tabs[4]:
         st.subheader("Démographie")
         if not has_qc():
@@ -1481,19 +1638,14 @@ def main():
                             "IID": [iids[i] for i in top_idx],
                             "Pop": [labels[i] for i in top_idx],
                             "FROH": froh[top_idx]})
-                        st.subheader("Top 10 individus les plus consanguins")
+                        st.subheader("Top 10 les plus consanguins")
                         st.dataframe(top_df.round(4),
                                      use_container_width=True)
                         st.plotly_chart(
                             plot_roh_manhattan(roh_df, iids),
                             use_container_width=True)
-                        with st.expander("Voir tous les ROH détectés"):
-                            tmp = roh_df.copy()
-                            tmp["IID"] = [iids[i] for i in tmp["IID_idx"]]
-                            st.dataframe(tmp.head(500),
-                                         use_container_width=True)
 
-    # ---------- TAB 6 : Sélection ----------
+    # ---------- TAB 6 ----------
     with tabs[5]:
         st.subheader("Signatures de sélection")
         if not has_qc():
@@ -1533,21 +1685,8 @@ def main():
                             threshold_q=threshold_q)
                         if fig:
                             st.plotly_chart(fig, use_container_width=True)
-                        q_up = float(np.nanquantile(
-                            st.session_state.fst, threshold_q))
-                        mask = (np.isfinite(st.session_state.fst)
-                                & (st.session_state.fst >= q_up))
-                        outliers = st.session_state.snp_filt[mask].copy()
-                        outliers["FST"] = st.session_state.fst[mask]
-                        outliers = outliers.sort_values("FST",
-                                                        ascending=False)
-                        st.subheader(f"SNPs outliers ({len(outliers)})")
-                        st.dataframe(outliers,
-                                     use_container_width=True)
 
             with sub2:
-                st.markdown("FST de Nei pairwise entre toutes les "
-                            "paires de populations.")
                 if st.button("▶ Calculer FST pairwise", key="btn_fstp",
                              use_container_width=True):
                     try:
@@ -1567,23 +1706,13 @@ def main():
                             st.session_state.fst_pairwise_matrix,
                             st.session_state.fst_pops),
                         use_container_width=True)
-                    mat = st.session_state.fst_pairwise_matrix
-                    pops = st.session_state.fst_pops
-                    df_mat = pd.DataFrame(mat, index=pops, columns=pops)
-                    st.dataframe(df_mat.round(4),
-                                 use_container_width=True)
 
-    # ---------- TAB 7 : Export ----------
+    # ---------- TAB 7 ----------
     with tabs[6]:
         st.subheader("Export des données post-QC")
         if not has_qc():
             st.warning("⚠️ Lancez d'abord le QC.")
         else:
-            st.markdown("""
-            - **PLINK** : `.bed` + `.bim` + `.fam` (binaire PLINK 1)
-            - **VCF 4.2** : texte standard
-            - **ZIP** : archive PLINK prête à l'emploi
-            """)
             prefix = st.text_input("Préfixe des fichiers", "bovine_qc")
             c1, c2, c3 = st.columns(3)
 
@@ -1637,7 +1766,7 @@ def main():
                 st.metric("SNPs exportés",
                           st.session_state.gt_filt.shape[1])
 
-    # ---------- TAB 8 : Rapport ----------
+    # ---------- TAB 8 ----------
     with tabs[7]:
         st.subheader("Rapport HTML")
         if not has_qc():
@@ -1693,7 +1822,7 @@ def main():
                     st.components.v1.html(html, height=700,
                                           scrolling=True)
 
-    # ---------- PIPELINE COMPLET ----------
+    # ---------- PIPELINE ----------
     if st.session_state.get("run_requested"):
         st.session_state.run_requested = False
         try:
