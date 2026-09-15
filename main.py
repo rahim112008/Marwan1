@@ -2,7 +2,7 @@
 🐄 Bovine SNP Platform
 Pipeline complet de bioinformatique pour puces SNP bovines.
 
-Version 3.2 — Parser PED universel :
+Version 3.2.1 — Parser PED universel (correction syntaxe) :
   - Détection automatique du format (texte / gzip / binaire PLINK)
   - Auto-ajustement du nombre de SNPs (PED ≠ MAP)
   - Détection du format transposé (--tfile)
@@ -233,9 +233,8 @@ def parse_ped(ped_bytes: bytes, n_snp_map: int) -> tuple:
     diag = _diagnose_ped_first_line(lines[0], n_snp_map)
     n_cols_first = diag["n_cols"]
     n_snp_ped = diag["n_snp_inferred"]
-    expected_cols = diag["expected_cols"]
 
-    # Cas particulier : format transposé (peu de colonnes, détection de tfile)
+    # Cas particulier : trop peu de colonnes
     if n_cols_first < 7:
         raise ValueError(
             f"❌ Format PED invalide.\n"
@@ -244,8 +243,8 @@ def parse_ped(ped_bytes: bytes, n_snp_map: int) -> tuple:
             f"(FID, IID, PID, MID, SEX, PHENO + génotypes).\n"
             f"   → Vérifiez le séparateur (espaces/tabulations) ou le format.")
 
-    # Cas particulier : fichier transposé (ex: 1 SNP par ligne, format --tfile)
-    if n_snp_ped > 0 and n_snp_ped < 10 and len(lines) > 100:
+    # Cas particulier : format transposé (--tfile)
+    if 0 < n_snp_ped < 10 and len(lines) > 100:
         raise ValueError(
             f"⚠️ Fichier probablement au format TRANSPOSÉ (--tfile).\n"
             f"   {len(lines)} lignes × {n_cols_first} colonnes "
@@ -289,26 +288,26 @@ def parse_ped(ped_bytes: bytes, n_snp_map: int) -> tuple:
 
     # --- 6. Rapport d'erreur détaillé si échec complet ---
     if n_ind == 0:
-        # Trouver la longueur de ligne la plus fréquente
         top_lengths = lengths_seen.most_common(3)
-        top_str = ", ".join([f"{length} cols × {count} lignes"
-                             for length, count in top_lengths])
-        raise ValueError(
-            f"❌ Aucun individu chargé.\n\n"
-            f"**Diagnostic automatique :**\n"
-            f   "• Nombre de SNPs dans le MAP : **{n_snp_map}**\n"
+        top_str = ", ".join(
+            [f"{length} cols x {count} lignes"
+             for length, count in top_lengths])
+
+        error_msg = (
+            "❌ Aucun individu chargé.\n\n"
+            "**Diagnostic automatique :**\n"
+            f"• Nombre de SNPs dans le MAP : **{n_snp_map}**\n"
             f"• Colonnes attendues par ligne : **{expected_cols_eff}**\n"
             f"• 1ère ligne PED : **{n_cols_first}** colonnes\n"
             f"• Longueurs les plus fréquentes : {top_str}\n"
             f"• Lignes trop courtes : {rejected_short}\n"
             f"• Lignes quasi-vides : {rejected_empty}\n\n"
-            f"**Causes probables :**\n"
-            f"1. Le fichier est **tronqué** (upload interrompu)\n"
-            f"2. Le **PED et le MAP ne correspondent pas**\n"
-            f"3. Le séparateur n'est pas un espace (mais tabulation "
-            f"incohérente ou autre)\n"
-            f"4. Le fichier n'est pas en format PLINK PED (ex: VCF, "
-            f"CSV, .raw)")
+            "**Causes probables :**\n"
+            "1. Le fichier est **tronqué** (upload interrompu)\n"
+            "2. Le **PED et le MAP ne correspondent pas**\n"
+            "3. Le séparateur n'est pas un espace\n"
+            "4. Le fichier n'est pas en format PLINK PED (ex: VCF, CSV)")
+        raise ValueError(error_msg)
 
     if rejected_short > 0:
         st.warning(
@@ -346,7 +345,7 @@ def parse_ped(ped_bytes: bytes, n_snp_map: int) -> tuple:
 
     ind_df = pd.DataFrame({"FID": fids, "IID": iids})
 
-    # --- 9. Alignement avec le MAP (troncature si désaligné) ---
+    # --- 9. Alignement avec le MAP ---
     if n_snp_eff < n_snp_map:
         st.info(
             f"ℹ️ Le MAP contenait {n_snp_map} SNPs, mais seulement "
@@ -510,9 +509,16 @@ def generate_demo_data(n_ind: int = 150, n_snp: int = 800,
 # QC — MÉTRIQUES
 # ============================================================
 
-def missingness_per_ind(gt): return np.isnan(gt).mean(axis=1)
-def missingness_per_snp(gt): return np.isnan(gt).mean(axis=0)
-def allele_freq(gt): return np.nanmean(gt, axis=0) / 2.0
+def missingness_per_ind(gt):
+    return np.isnan(gt).mean(axis=1)
+
+
+def missingness_per_snp(gt):
+    return np.isnan(gt).mean(axis=0)
+
+
+def allele_freq(gt):
+    return np.nanmean(gt, axis=0) / 2.0
 
 
 def maf(gt):
@@ -1211,7 +1217,7 @@ def build_report_html(config, stats, figures=None):
 </ul></div>
 {figs_html}
 <hr><p style="font-size:0.85em; color:#666">
-Rapport généré automatiquement par Bovine SNP Platform v3.2.</p>
+Rapport généré automatiquement par Bovine SNP Platform v3.2.1.</p>
 </body></html>
 """
 
@@ -1312,12 +1318,12 @@ def main():
                         st.info(f"📋 MAP chargé : **{len(map_df)}** SNPs")
 
                         with st.spinner(
-                            f"Parsing du .ped ({ped_file.size/1024/1024:.1f} Mo)..."
+                            f"Parsing du .ped "
+                            f"({ped_file.size / 1024 / 1024:.1f} Mo)..."
                         ):
                             gt, ind_df, rej_ped = parse_ped(
                                 ped_file.read(), len(map_df))
 
-                        # Tronquer le MAP si désaligné
                         if len(map_df) != gt.shape[1]:
                             map_df = map_df.iloc[:gt.shape[1]].reset_index(
                                 drop=True)
@@ -1383,7 +1389,7 @@ def main():
                 st.session_state.run_requested = True
 
         st.divider()
-        st.caption("v3.2 — Parser PED universel · PLINK/VCF · NMF · ROH · "
+        st.caption("v3.2.1 — Parser PED universel · PLINK/VCF · NMF · ROH · "
                    "FST pairwise · Cache · ARS-UCD1.2")
 
     # ---------- MAIN ----------
@@ -1417,7 +1423,7 @@ def main():
                     "📈 Démographie", "🔍 Sélection", "📤 Export",
                     "📄 Rapport"])
 
-    # ---------- TAB 1 ----------
+    # ---------- TAB 1 : Aperçu ----------
     with tabs[0]:
         c1, c2, c3 = st.columns(3)
         c1.metric("Individus", gt.shape[0])
@@ -1450,7 +1456,7 @@ def main():
             if cov:
                 st.dataframe(pd.DataFrame(cov), use_container_width=True)
 
-    # ---------- TAB 2 ----------
+    # ---------- TAB 2 : QC ----------
     with tabs[1]:
         st.subheader("Contrôle qualité")
         if st.button("▶ Lancer le QC", use_container_width=True):
@@ -1497,7 +1503,7 @@ def main():
         else:
             st.info("Cliquez sur **Lancer le QC**.")
 
-    # ---------- TAB 3 ----------
+    # ---------- TAB 3 : Structure ----------
     with tabs[2]:
         st.subheader("Structure des populations")
         if not has_qc():
@@ -1536,7 +1542,7 @@ def main():
                     st.session_state.kinship, id_labels),
                     use_container_width=True)
 
-    # ---------- TAB 4 ----------
+    # ---------- TAB 4 : Admixture ----------
     with tabs[3]:
         st.subheader("Proportions d'ancestralité (NMF)")
         if not has_qc():
@@ -1570,7 +1576,7 @@ def main():
                     [f"K{k+1}" for k in range(K)]].mean()
                 st.dataframe(tmp.round(3), use_container_width=True)
 
-    # ---------- TAB 5 ----------
+    # ---------- TAB 5 : Démographie ----------
     with tabs[4]:
         st.subheader("Démographie")
         if not has_qc():
@@ -1645,7 +1651,7 @@ def main():
                             plot_roh_manhattan(roh_df, iids),
                             use_container_width=True)
 
-    # ---------- TAB 6 ----------
+    # ---------- TAB 6 : Sélection ----------
     with tabs[5]:
         st.subheader("Signatures de sélection")
         if not has_qc():
@@ -1707,7 +1713,7 @@ def main():
                             st.session_state.fst_pops),
                         use_container_width=True)
 
-    # ---------- TAB 7 ----------
+    # ---------- TAB 7 : Export ----------
     with tabs[6]:
         st.subheader("Export des données post-QC")
         if not has_qc():
@@ -1766,7 +1772,7 @@ def main():
                 st.metric("SNPs exportés",
                           st.session_state.gt_filt.shape[1])
 
-    # ---------- TAB 8 ----------
+    # ---------- TAB 8 : Rapport ----------
     with tabs[7]:
         st.subheader("Rapport HTML")
         if not has_qc():
@@ -1822,7 +1828,7 @@ def main():
                     st.components.v1.html(html, height=700,
                                           scrolling=True)
 
-    # ---------- PIPELINE ----------
+    # ---------- PIPELINE COMPLET ----------
     if st.session_state.get("run_requested"):
         st.session_state.run_requested = False
         try:
